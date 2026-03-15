@@ -232,19 +232,19 @@ fi
 Place this in `.zshrc`:
 
 ```bash
-function prompt_my_zmx_session() {
+function prompt_my_zmosh_session() {
   if [[ -n $ZMX_SESSION ]]; then
     p10k segment -b '%k' -f '%f' -t "[$ZMX_SESSION]"
   fi
 }
-POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS+=my_zmx_session
+POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS+=my_zmosh_session
 ```
 
 ### oh-my-posh
 
 [oh-my-posh](https://ohmyposh.dev) is a popular shell themeing and prompt engine. This code will display an icon and session name as part of the prompt if (and only if) you have a session active:
 
-```
+```toml
 [[blocks.segments]]
    template = '{{ if .Env.ZMX_SESSION }} {{ .Env.ZMX_SESSION }}{{ end }}'
    foreground = 'p:orange'
@@ -252,6 +252,81 @@ POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS+=my_zmx_session
    type = 'text'
    style = 'plain'
 ```
+
+### Starship
+
+[Starship](https://starship.rs) is a popular shell themeing and prompt engine. This code will display an icon and session name as part of the prompt if (and only if) you have a session active:
+
+```toml
+format = """
+${env_var.ZMX_SESSION}\
+...
+"""
+
+[env_var.ZMX_SESSION]
+symbol = " "
+format = "[$symbol$env_value]($style) "
+description = "zmosh session name"
+style = "bold magenta"
+```
+
+## session picker
+
+You can add an interactive session picker to your shell that lets you fuzzy-find existing sessions, preview their scrollback history, or create new ones — all from a single prompt. This is especially useful for remote SSH workflows.
+
+Requires [fzf](https://github.com/junegunn/fzf).
+
+- **Enter** selects a matched session (or creates one if no sessions exist)
+- **Ctrl-N** creates a new session using the typed query, even when a fuzzy match is highlighted
+
+<details>
+<summary>bash and zsh</summary>
+
+```bash
+zmosh-select() {
+  local sessions
+  sessions=$(zmosh list --short 2>/dev/null)
+
+  local output query key selected session_name
+  output=$({ [[ -n "$sessions" ]] && echo "$sessions"; } | fzf \
+    --print-query \
+    --expect=ctrl-n \
+    --height=80% \
+    --reverse \
+    --prompt="zmosh> " \
+    --header="Enter: select | Ctrl-N: create new" \
+    --preview='zmosh history {}' \
+    --preview-window=right:60%:follow \
+  )
+  local rc=$?
+
+  query=$(echo "$output" | sed -n '1p')
+  key=$(echo "$output" | sed -n '2p')
+  selected=$(echo "$output" | sed -n '3p')
+
+  if [[ "$key" == "ctrl-n" && -n "$query" ]]; then
+    session_name="$query"
+  elif [[ $rc -eq 0 && -n "$selected" ]]; then
+    session_name="$selected"
+  elif [[ -n "$query" ]]; then
+    session_name="$query"
+  else
+    return 130
+  fi
+
+  zmosh attach "$session_name"
+}
+```
+
+You can call `zmosh-select` manually, bind it to a key, or auto-launch it on shell startup when outside a zmosh session. With `&& exit`, the normal flow becomes: connect via SSH -> pick a session -> work -> detach or exit the session -> SSH disconnects automatically. Cancelling the picker with **Ctrl-C** drops you into a regular shell as an escape hatch.
+
+```bash
+if command -v zmosh &> /dev/null && command -v fzf &> /dev/null && [[ -z "$ZMX_SESSION" ]]; then
+  zmosh-select && exit
+fi
+```
+
+</details>
 
 ## shell completion
 
@@ -283,7 +358,7 @@ fi
 
 ### fish
 
-Add this to your `.config/fish/config.fish` file:
+Add this to `~/.config/fish/completions/zmosh.fish`:
 
 ```fish
 if type -q zmosh
@@ -426,6 +501,7 @@ Remote sessions use a **gateway** pattern that bridges encrypted UDP to the exis
 
 ## known issues
 
+- When upgrading versions where we make changes to the underlying IPC communication, it will kill all your sessions because it cannot communicate through the daemon socket properly
 - Terminal state rehydration with nested sessions through SSH: host A `zmosh` -> SSH -> host B `zmosh`
   - Specifically cursor position gets corrupted
 - When re-attaching and kitty keyboard mode was previously enabled, we try to re-send that CSI query to re-enable it
