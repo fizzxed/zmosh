@@ -249,7 +249,7 @@ pub const Gateway = struct {
 
         // Notify client that the session has ended.
         if (self.peer.addr != null) {
-            self.sendIpcReliable(.SessionEnd, "", @intCast(std.time.nanoTimestamp())) catch |err| {
+            self.sendIpcReliable(@enumFromInt(11), "", @intCast(std.time.nanoTimestamp())) catch |err| { // SessionEnd
                 log.debug("failed to send SessionEnd: {s}", .{@errorName(err)});
             };
         }

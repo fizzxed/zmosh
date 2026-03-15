@@ -435,7 +435,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                 } else {
                                     try stdout_buf.appendSlice(alloc, payload);
                                 }
-                            } else if (hdr.tag == .SessionEnd) {
+                            } else if (@intFromEnum(hdr.tag) == 11) { // SessionEnd
                                 session_ended = true;
                             }
 
