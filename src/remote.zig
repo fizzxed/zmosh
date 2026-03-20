@@ -248,6 +248,13 @@ fn requestResync(
     last_resync_request_ns.* = now;
 }
 
+fn debugWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
+    const file = f orelse return;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    file.writeAll(msg) catch return;
+}
+
 /// Remote attach: connect to a remote zmx session via UDP.
 pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     // Resolve host address — try numeric IP first, fall back to DNS
@@ -275,6 +282,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     defer reliable_send.deinit();
     var reliable_recv = transport.RecvState{};
     var output_recv = transport.OutputRecvState{};
+
+    const debug_log: ?std.fs.File = std.fs.createFileAbsolute("/tmp/zmosh-debug.log", .{ .truncate = true }) catch null;
+    defer if (debug_log) |f| f.close();
+    debugWrite(debug_log, "zmosh debug log started\n", .{});
 
     // Set terminal to raw mode
     var orig_termios: c.termios = undefined;
@@ -317,6 +328,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
     var last_resync_request_ns: i64 = 0;
+    var last_stats_dump_ns: i64 = 0;
 
     // Send Init message with terminal size (reliable)
     const size = getTerminalSize();
@@ -326,6 +338,18 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
     while (true) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
+
+        // Periodic debug stats dump
+        if (now - last_stats_dump_ns >= 2 * std.time.ns_per_s) {
+            debugWrite(debug_log, "stats: delivered={d} buffered={d} gap_resync={d} max_reorder={d} stdout_buf={d}\n", .{
+                output_recv.delivered_total,
+                output_recv.buffered_total,
+                output_recv.gap_resync_total,
+                output_recv.max_reorder_dist,
+                stdout_buf.items.len,
+            });
+            last_stats_dump_ns = now;
+        }
 
         // Check SIGWINCH
         if (sigwinch_received.swap(false, .acq_rel)) {
@@ -450,10 +474,14 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                         switch (output_recv.onPacket(packet.seq, packet.payload)) {
                             .delivered => {
                                 const deliveries = output_recv.deliverSlice();
+                                if (deliveries.len() > 1) {
+                                    debugWrite(debug_log, "REORDER_RECOVERY count={d}\n", .{deliveries.len()});
+                                }
                                 for (0..deliveries.len()) |i| {
                                     const p = deliveries.get(i);
                                     if (p.len == 0) continue;
                                     if (stdout_buf.items.len + p.len > max_stdout_buf) {
+                                        debugWrite(debug_log, "STDOUT_OVERFLOW buf={d} payload={d}\n", .{ stdout_buf.items.len, p.len });
                                         stdout_buf.clearRetainingCapacity();
                                         try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
                                         break;
@@ -463,6 +491,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                             },
                             .buffered => {},
                             .gap_resync => {
+                                debugWrite(debug_log, "GAP_RESYNC seq={d} expected={d}\n", .{ packet.seq, output_recv.expected });
                                 stdout_buf.clearRetainingCapacity();
                                 try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
                             },

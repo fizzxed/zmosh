@@ -346,6 +346,7 @@ pub const Gateway = struct {
             self.peer.send(&self.udp_sock, pkt) catch |err| {
                 if (err == error.WouldBlock) {
                     // Retain unsent data for next flush cycle
+                    log.debug("udp WouldBlock; retaining {d} unsent bytes", .{self.output_coalesce_buf.items.len - sent_off});
                     break;
                 }
                 if (err == error.NoPeerAddress) {
@@ -476,7 +477,7 @@ pub const Gateway = struct {
     fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
         if (tag == .Output) {
             if (self.output_coalesce_buf.items.len + payload.len > max_output_coalesce) {
-                log.debug("output coalesce buffer overflow; dropping stale output and requesting snapshot", .{});
+                log.debug("output coalesce overflow buf={d} payload={d}; requesting snapshot", .{ self.output_coalesce_buf.items.len, payload.len });
                 self.output_coalesce_buf.clearRetainingCapacity();
                 try self.requestSnapshot(now);
                 return;

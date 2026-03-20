@@ -92,6 +92,12 @@ pub const OutputRecvState = struct {
     deliver_start: u32 = 0,
     deliver_count: usize = 0,
 
+    // Diagnostic counters
+    delivered_total: u64 = 0,
+    buffered_total: u64 = 0,
+    gap_resync_total: u64 = 0,
+    max_reorder_dist: u32 = 0,
+
     const Slot = struct {
         occupied: bool = false,
         len: usize = 0,
@@ -132,6 +138,7 @@ pub const OutputRecvState = struct {
                 count += 1;
             }
             self.deliver_count = count;
+            self.delivered_total += count;
             // Clear delivered slots (data stays valid until next onPacket call)
             var s = seq;
             for (0..count) |_| {
@@ -152,12 +159,15 @@ pub const OutputRecvState = struct {
             // Too far ahead — unrecoverable gap
             self.clearAllSlots();
             self.expected = seq +% 1;
+            self.gap_resync_total += 1;
             return .gap_resync;
         }
 
         // Within window: buffer (detect duplicate buffered packets)
         if (self.slots[seq % window_size].occupied) return .duplicate;
         self.storeSlot(seq, payload);
+        self.buffered_total += 1;
+        self.max_reorder_dist = @max(self.max_reorder_dist, gap);
         return .buffered;
     }
 
