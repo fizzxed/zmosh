@@ -31,10 +31,11 @@ pub const ReliableAction = enum {
 };
 
 pub const OutputAction = enum {
-    accept,
+    delivered,
+    buffered,
     duplicate,
     stale,
-    gap,
+    gap_resync,
 };
 
 pub const RecvState = struct {
@@ -82,28 +83,99 @@ pub const RecvState = struct {
 };
 
 pub const OutputRecvState = struct {
-    latest: u32 = 0,
-    has_latest: bool = false,
+    pub const window_size = 32;
 
-    pub fn onPacket(self: *OutputRecvState, seq: u32) OutputAction {
-        if (!self.has_latest) {
-            self.latest = seq;
-            self.has_latest = true;
-            return .accept;
+    expected: u32 = 0,
+    has_expected: bool = false,
+
+    slots: [window_size]Slot = [1]Slot{.{}} ** window_size,
+    deliver_start: u32 = 0,
+    deliver_count: usize = 0,
+
+    const Slot = struct {
+        occupied: bool = false,
+        len: usize = 0,
+        data: [max_payload_len]u8 = undefined,
+    };
+
+    pub const DeliverySlice = struct {
+        state: *const OutputRecvState,
+
+        pub fn len(self: DeliverySlice) usize {
+            return self.state.deliver_count;
         }
 
-        if (seq == self.latest + 1) {
-            self.latest = seq;
-            return .accept;
+        pub fn get(self: DeliverySlice, i: usize) []const u8 {
+            const seq = self.state.deliver_start +% @as(u32, @intCast(i));
+            const slot = &self.state.slots[seq % window_size];
+            return slot.data[0..slot.len];
+        }
+    };
+
+    pub fn onPacket(self: *OutputRecvState, seq: u32, payload: []const u8) OutputAction {
+        self.deliver_count = 0;
+
+        if (!self.has_expected) {
+            self.expected = seq;
+            self.has_expected = true;
         }
 
-        if (seq <= self.latest) {
-            return .duplicate;
+        if (seq == self.expected) {
+            // In-order: store, deliver this + any consecutive buffered
+            self.storeSlot(seq, payload);
+            self.deliver_start = seq;
+            var next = seq +% 1;
+            var count: usize = 1;
+            while (count < window_size) {
+                if (!self.slots[next % window_size].occupied) break;
+                next +%= 1;
+                count += 1;
+            }
+            self.deliver_count = count;
+            // Clear delivered slots (data stays valid until next onPacket call)
+            var s = seq;
+            for (0..count) |_| {
+                self.slots[s % window_size].occupied = false;
+                s +%= 1;
+            }
+            self.expected = next;
+            return .delivered;
         }
 
-        // seq jumped ahead.
-        self.latest = seq;
-        return .gap;
+        if (seq < self.expected) {
+            return if (self.expected - seq <= window_size) .duplicate else .stale;
+        }
+
+        // seq > expected: out-of-order
+        const gap = seq - self.expected;
+        if (gap >= window_size) {
+            // Too far ahead — unrecoverable gap
+            self.clearAllSlots();
+            self.expected = seq +% 1;
+            return .gap_resync;
+        }
+
+        // Within window: buffer (detect duplicate buffered packets)
+        if (self.slots[seq % window_size].occupied) return .duplicate;
+        self.storeSlot(seq, payload);
+        return .buffered;
+    }
+
+    fn storeSlot(self: *OutputRecvState, seq: u32, payload: []const u8) void {
+        const idx = seq % window_size;
+        @memcpy(self.slots[idx].data[0..payload.len], payload);
+        self.slots[idx].len = payload.len;
+        self.slots[idx].occupied = true;
+    }
+
+    fn clearAllSlots(self: *OutputRecvState) void {
+        for (&self.slots) |*slot| {
+            slot.occupied = false;
+        }
+    }
+
+    pub fn deliverSlice(self: *const OutputRecvState) DeliverySlice {
+        return .{ .state = self };
     }
 };
 
@@ -310,9 +382,58 @@ test "reliable recv window" {
     try std.testing.expectEqual(@as(u32, 11), recv.ack());
 }
 
-test "output gap detection" {
+test "output reorder within window" {
     var out = OutputRecvState{};
-    try std.testing.expect(out.onPacket(1) == .accept);
-    try std.testing.expect(out.onPacket(3) == .gap);
-    try std.testing.expect(out.onPacket(2) == .duplicate);
+
+    // Packet 1 in order
+    try std.testing.expect(out.onPacket(1, "aaa") == .delivered);
+    try std.testing.expectEqual(@as(usize, 1), out.deliverSlice().len());
+    try std.testing.expectEqualStrings("aaa", out.deliverSlice().get(0));
+
+    // Packet 3 out of order (buffered)
+    try std.testing.expect(out.onPacket(3, "ccc") == .buffered);
+
+    // Packet 2 fills the gap, delivers 2 and 3
+    try std.testing.expect(out.onPacket(2, "bbb") == .delivered);
+    const d = out.deliverSlice();
+    try std.testing.expectEqual(@as(usize, 2), d.len());
+    try std.testing.expectEqualStrings("bbb", d.get(0));
+    try std.testing.expectEqualStrings("ccc", d.get(1));
+}
+
+test "output no false gap on reorder" {
+    var out = OutputRecvState{};
+    try std.testing.expect(out.onPacket(1, "a") == .delivered);
+    try std.testing.expect(out.onPacket(4, "d") == .buffered);
+    try std.testing.expect(out.onPacket(3, "c") == .buffered);
+    try std.testing.expect(out.onPacket(2, "b") == .delivered);
+    const d = out.deliverSlice();
+    try std.testing.expectEqual(@as(usize, 3), d.len());
+    try std.testing.expectEqualStrings("b", d.get(0));
+    try std.testing.expectEqualStrings("c", d.get(1));
+    try std.testing.expectEqualStrings("d", d.get(2));
+}
+
+test "output true gap beyond window" {
+    var out = OutputRecvState{};
+    try std.testing.expect(out.onPacket(1, "a") == .delivered);
+    // Seq 50 is 48 away from expected=2, which is >= window_size (32)
+    try std.testing.expect(out.onPacket(50, "z") == .gap_resync);
+}
+
+test "output duplicate detection with reorder buffer" {
+    var out = OutputRecvState{};
+    try std.testing.expect(out.onPacket(1, "a") == .delivered);
+    try std.testing.expect(out.onPacket(1, "a") == .duplicate);
+    try std.testing.expect(out.onPacket(3, "c") == .buffered);
+    try std.testing.expect(out.onPacket(3, "c") == .duplicate);
+}
+
+test "output large sequential burst" {
+    var out = OutputRecvState{};
+    for (1..101) |i| {
+        const seq: u32 = @intCast(i);
+        try std.testing.expect(out.onPacket(seq, "x") == .delivered);
+        try std.testing.expectEqual(@as(usize, 1), out.deliverSlice().len());
+    }
 }

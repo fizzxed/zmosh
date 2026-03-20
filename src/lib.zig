@@ -338,13 +338,18 @@ export fn zmosh_poll(session: ?*Session) Status {
                 }
             },
             .output => {
-                switch (s.output_recv.onPacket(packet.seq)) {
-                    .accept => {
-                        if (packet.payload.len > 0) {
-                            s.output_cb(s.ctx, packet.payload.ptr, @intCast(packet.payload.len));
+                switch (s.output_recv.onPacket(packet.seq, packet.payload)) {
+                    .delivered => {
+                        const deliveries = s.output_recv.deliverSlice();
+                        for (0..deliveries.len()) |i| {
+                            const p = deliveries.get(i);
+                            if (p.len > 0) {
+                                s.output_cb(s.ctx, p.ptr, @intCast(p.len));
+                            }
                         }
                     },
-                    .gap => {
+                    .buffered => {},
+                    .gap_resync => {
                         requestResync(s, now) catch {};
                     },
                     .duplicate, .stale => {},

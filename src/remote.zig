@@ -7,7 +7,7 @@ const transport = @import("transport.zig");
 const builtin = @import("builtin");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
-const max_stdout_buf = 4 * 1024 * 1024;
+const max_stdout_buf = 16 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
@@ -447,17 +447,23 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                         }
                     },
                     .output => {
-                        switch (output_recv.onPacket(packet.seq)) {
-                            .accept => {
-                                if (packet.payload.len == 0) continue;
-                                if (stdout_buf.items.len + packet.payload.len > max_stdout_buf) {
-                                    stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, packet.payload);
+                        switch (output_recv.onPacket(packet.seq, packet.payload)) {
+                            .delivered => {
+                                const deliveries = output_recv.deliverSlice();
+                                for (0..deliveries.len()) |i| {
+                                    const p = deliveries.get(i);
+                                    if (p.len == 0) continue;
+                                    if (stdout_buf.items.len + p.len > max_stdout_buf) {
+                                        stdout_buf.clearRetainingCapacity();
+                                        try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                        break;
+                                    }
+                                    try stdout_buf.appendSlice(alloc, p);
                                 }
                             },
-                            .gap => {
+                            .buffered => {},
+                            .gap_resync => {
+                                stdout_buf.clearRetainingCapacity();
                                 try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
                             },
                             .duplicate, .stale => {},

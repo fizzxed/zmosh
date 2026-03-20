@@ -9,7 +9,7 @@ const log = std.log.scoped(.serve);
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_unix_write_buf = 1024 * 1024;
-const max_output_coalesce = 256 * 1024;
+const max_output_coalesce = 2 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
@@ -334,11 +334,9 @@ pub const Gateway = struct {
             const chunk = self.output_coalesce_buf.items[sent_off..end];
 
             var pkt_buf: [1200]u8 = undefined;
-            const seq = self.output_seq;
-            self.output_seq +%= 1;
             const pkt = try transport.buildUnreliable(
                 .output,
-                seq,
+                self.output_seq,
                 self.reliable_recv.ack(),
                 self.reliable_recv.ackBits(),
                 chunk,
@@ -347,11 +345,8 @@ pub const Gateway = struct {
 
             self.peer.send(&self.udp_sock, pkt) catch |err| {
                 if (err == error.WouldBlock) {
-                    log.debug("udp output send would block; dropping stale output and requesting resync", .{});
-                    self.output_coalesce_buf.clearRetainingCapacity();
-                    try self.requestSnapshot(now);
-                    self.last_output_flush_ns = now;
-                    return;
+                    // Retain unsent data for next flush cycle
+                    break;
                 }
                 if (err == error.NoPeerAddress) {
                     self.output_coalesce_buf.clearRetainingCapacity();
@@ -361,6 +356,7 @@ pub const Gateway = struct {
                 return err;
             };
 
+            self.output_seq +%= 1;
             sent_off = end;
         }
 
