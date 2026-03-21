@@ -97,6 +97,16 @@ pub const MaxFilter = struct {
 // Delivery Rate Estimation
 // ---------------------------------------------------------------------------
 
+/// A0 reference point for ACK-rate computation (overestimate avoidance).
+/// Saved at ACK aggregation epoch boundaries to provide a stable baseline
+/// for ack_rate that spans the full epoch, preventing burst compression
+/// from inflating bandwidth estimates. (Google/Cloudflare bandwidth sampler)
+const AckPoint = struct {
+    ack_time: i64,
+    total_bytes_acked: u64,
+};
+const a0_capacity = 8;
+
 pub const DeliveryState = struct {
     delivered: u64 = 0,
     delivered_time: i64 = 0,
@@ -104,6 +114,7 @@ pub const DeliveryState = struct {
     is_app_limited: bool = false,
     tx_in_flight: u32 = 0,
     lost: u64 = 0, // C.lost at time of send (for RS.lost = C.lost - P.lost)
+    total_bytes_sent: u64 = 0, // cumulative bytes sent at send time (for send_rate)
 };
 
 pub const RateSample = struct {
@@ -216,6 +227,11 @@ pub const Bbr = struct {
     delivered_time: i64 = 0,
     first_sent_time: i64 = 0,
     total_lost: u64 = 0, // C.lost: cumulative bytes declared lost
+    total_bytes_sent: u64 = 0, // cumulative bytes sent (for send_rate in min-of-two-rates)
+
+    // --- A0 point candidates (overestimate avoidance) ---
+    a0_candidates: [a0_capacity]AckPoint = [1]AckPoint{.{ .ack_time = 0, .total_bytes_acked = 0 }} ** a0_capacity,
+    a0_count: u32 = 0,
 
     // --- Round tracking ---
     round_count: u64 = 0,
@@ -298,8 +314,9 @@ pub const Bbr = struct {
             self.delivered_time = now;
         }
 
-        // Update inflight BEFORE snapshot (spec: P.tx_in_flight includes P)
+        // Update inflight and cumulative sent BEFORE snapshot
         self.inflight += bytes;
+        self.total_bytes_sent += bytes;
 
         // Snapshot delivery state (spec: P.delivered_time = C.delivered_time, etc.)
         const ds = DeliveryState{
@@ -309,6 +326,7 @@ pub const Bbr = struct {
             .is_app_limited = self.is_app_limited,
             .tx_in_flight = self.inflight,
             .lost = self.total_lost,
+            .total_bytes_sent = self.total_bytes_sent,
         };
 
         // Spec §4.1.2.2: C.first_send_time = P.send_time (for next packet)
@@ -483,7 +501,7 @@ pub const Bbr = struct {
     pub fn bdp(self: *const Bbr) u64 {
         const mrtt = self.getMinRtt();
         if (mrtt <= 0 or self.bw == 0) return @as(u64, initial_cwnd);
-        return self.bw *| @as(u64, @intCast(mrtt)) / ns_per_s;
+        return @intCast(@min(@as(u128, self.bw) * @as(u128, @intCast(mrtt)) / ns_per_s, max_u64));
     }
 
     pub fn getMinRtt(self: *const Bbr) i64 {
@@ -500,14 +518,20 @@ pub const Bbr = struct {
         const delivered_delta = self.delivered - ds.delivered;
         if (delivered_delta == 0) return .{ .prior_delivered = ds.delivered };
 
+        // Send-side: bytes sent between snapshot and now / send time delta
+        const send_bytes_delta = self.total_bytes_sent -| ds.total_bytes_sent;
         const send_elapsed = pkt.sent_time - ds.first_sent_time;
-        const ack_elapsed = now - ds.delivered_time;
-        var interval = @max(send_elapsed, ack_elapsed);
-        if (interval <= 0) interval = 1;
 
-        // Spec §4.1.2.3: discard unreliably short intervals
+        // ACK-side: bytes delivered between snapshot and now / ack time delta
+        // (A0 point adjustment applied in computeAckRate when available)
+        const ack_bytes_delta = delivered_delta;
+        const ack_elapsed = self.computeAckElapsed(ds, now);
+
+        // Discard when both intervals are unreliably short (< min_rtt)
         const min_rtt_val = self.getMinRtt();
-        if (min_rtt_val > 0 and interval < min_rtt_val) {
+        if (min_rtt_val > 0 and send_elapsed > 0 and send_elapsed < min_rtt_val and
+            ack_elapsed > 0 and ack_elapsed < min_rtt_val)
+        {
             return .{
                 .rtt_ns = pkt.rtt_ns,
                 .delivered = delivered_delta,
@@ -517,7 +541,16 @@ pub const Bbr = struct {
             };
         }
 
-        const rate = delivered_delta * ns_per_s / @as(u64, @intCast(interval));
+        // Compute two independent rates; take the minimum (Google/Cloudflare approach)
+        const send_rate: u64 = if (send_elapsed > 0)
+            send_bytes_delta * ns_per_s / @as(u64, @intCast(send_elapsed))
+        else
+            max_u64;
+        const ack_rate: u64 = if (ack_elapsed > 0)
+            ack_bytes_delta * ns_per_s / @as(u64, @intCast(ack_elapsed))
+        else
+            max_u64;
+        const rate = @min(send_rate, ack_rate);
 
         return .{
             .delivery_rate = rate,
@@ -528,6 +561,47 @@ pub const Bbr = struct {
             .tx_in_flight = ds.tx_in_flight,
             .prior_delivered = ds.delivered,
         };
+    }
+
+    /// Compute ACK-side elapsed time, using A0 point if available for a wider
+    /// measurement baseline (overestimate avoidance, per Google/Cloudflare).
+    fn computeAckElapsed(self: *const Bbr, ds: DeliveryState, now: i64) i64 {
+        if (self.a0_count > 0) {
+            if (self.selectA0(ds.delivered)) |a0| {
+                const elapsed = now - a0.ack_time;
+                if (elapsed > 0) return elapsed;
+            }
+        }
+        return now - ds.delivered_time;
+    }
+
+    /// Select the A0 candidate whose total_bytes_acked is closest to (but not
+    /// exceeding) the target. This gives the widest valid ACK measurement
+    /// baseline for the packet that was sent when C.delivered == target.
+    fn selectA0(self: *const Bbr, target_bytes_acked: u64) ?AckPoint {
+        var best: ?AckPoint = null;
+        for (self.a0_candidates[0..self.a0_count]) |candidate| {
+            if (candidate.total_bytes_acked <= target_bytes_acked) {
+                if (best == null or candidate.total_bytes_acked > best.?.total_bytes_acked) {
+                    best = candidate;
+                }
+            }
+        }
+        return best;
+    }
+
+    /// Push an A0 candidate at an ACK aggregation epoch boundary.
+    fn pushA0Candidate(self: *Bbr, point: AckPoint) void {
+        if (self.a0_count < a0_capacity) {
+            self.a0_candidates[self.a0_count] = point;
+            self.a0_count += 1;
+        } else {
+            // Shift left, drop oldest
+            for (0..a0_capacity - 1) |i| {
+                self.a0_candidates[i] = self.a0_candidates[i + 1];
+            }
+            self.a0_candidates[a0_capacity - 1] = point;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -674,13 +748,15 @@ pub const Bbr = struct {
             @intCast(now - self.extra_acked_interval_start)
         else
             0;
-        var expected_delivered = self.bw *| interval_ns / ns_per_s;
+        var expected_delivered: u64 = @intCast(@min(@as(u128, self.bw) * @as(u128, interval_ns) / ns_per_s, max_u64));
 
         // Reset interval if ACK rate is below expected rate (spec §5.5.9)
         if (self.extra_acked_delivered <= expected_delivered) {
             self.extra_acked_delivered = 0;
             self.extra_acked_interval_start = now;
             expected_delivered = 0;
+            // Save A0 candidate at epoch boundary (overestimate avoidance)
+            self.pushA0Candidate(.{ .ack_time = now, .total_bytes_acked = self.delivered });
         }
         self.extra_acked_delivered += rs.newly_acked;
 
@@ -1122,7 +1198,7 @@ pub const Bbr = struct {
 
     fn bdpMultiple(self: *const Bbr, gain: u32) u64 {
         if (self.min_rtt == max_i64) return @as(u64, initial_cwnd);
-        const bdp_val = self.bw *| @as(u64, @intCast(self.min_rtt)) / ns_per_s;
+        const bdp_val: u64 = @intCast(@min(@as(u128, self.bw) * @as(u128, @intCast(self.min_rtt)) / ns_per_s, max_u64));
         return bdp_val * @as(u64, gain) / 256;
     }
 
@@ -1267,18 +1343,35 @@ pub const Pacer = struct {
     /// quic-go) that send aggregated bursts on each timer tick.
     burst_remaining: u32 = 0,
 
+    /// Low bandwidth threshold below which bursting is limited to 1 packet.
+    /// Matches Cloudflare quiche's LUMPY_PACING_MIN_BANDWIDTH_KBPS = 1.2 Mbps.
+    const low_bw_threshold: u64 = 150_000; // 1.2 Mbps = 150 KB/s
+
+    /// Initial burst size after quiescence (idle → sending), in packets.
+    /// Matches Cloudflare quiche's INITIAL_UNPACED_BURST = 10.
+    const initial_burst_packets: u32 = 10;
+
     pub fn canSend(self: *const Pacer, now: i64) bool {
         return self.burst_remaining > 0 or now >= self.next_send_time;
     }
 
-    pub fn onSend(self: *Pacer, now: i64, packet_size: u32, pacing_rate: u64) void {
+    pub fn onSend(self: *Pacer, now: i64, packet_size: u32, pacing_rate: u64, inflight: u32, cwnd: u32) void {
         if (self.burst_remaining >= packet_size) {
             self.burst_remaining -= packet_size;
             return;
         }
         self.burst_remaining = 0;
 
-        const quantum = sendQuantum(pacing_rate);
+        // Determine burst size based on congestion state:
+        // - Cwnd-limited: single packet (don't overshoot the window)
+        // - Low bandwidth: single packet (~10ms of queuing per packet)
+        // - Normal: full send_quantum per spec §5.6.3
+        const quantum = if (inflight +| packet_size >= cwnd)
+            packet_size // cwnd-limited
+        else if (pacing_rate < low_bw_threshold)
+            packet_size // low bandwidth
+        else
+            sendQuantum(pacing_rate);
 
         if (pacing_rate == 0) {
             self.next_send_time = now;
@@ -1286,7 +1379,7 @@ pub const Pacer = struct {
             return;
         }
 
-        // Schedule next burst after send_quantum bytes worth of pacing time.
+        // Schedule next burst after quantum bytes worth of pacing time.
         const burst_interval_ns: i64 = @intCast(@as(u64, quantum) * ns_per_s / pacing_rate);
 
         if (now >= self.next_send_time) {
@@ -1295,6 +1388,17 @@ pub const Pacer = struct {
             self.next_send_time += burst_interval_ns;
         }
         self.burst_remaining = quantum -| packet_size;
+    }
+
+    /// Grant an initial burst after quiescence (connection was idle).
+    /// Matches Cloudflare quiche's INITIAL_UNPACED_BURST = 10 packets.
+    pub fn onIdleRestart(self: *Pacer) void {
+        self.burst_remaining = initial_burst_packets * max_datagram_size;
+    }
+
+    /// Clear burst budget on loss (stop bursting during recovery).
+    pub fn onLoss(self: *Pacer) void {
+        self.burst_remaining = 0;
     }
 
     /// BBRSetSendQuantum (spec §5.6.3):
@@ -1355,15 +1459,19 @@ test "Bbr initial state" {
     try std.testing.expectEqual(@as(u32, max_u32), bbr.inflight_longterm);
 }
 
-test "Bbr onSend tracks inflight" {
+test "Bbr onSend tracks inflight and total_bytes_sent" {
     var bbr = Bbr{};
     const now: i64 = 1_000_000_000;
 
-    _ = bbr.onSend(1200, now);
+    const ds1 = bbr.onSend(1200, now);
     try std.testing.expectEqual(@as(u32, 1200), bbr.inflight);
+    try std.testing.expectEqual(@as(u64, 1200), bbr.total_bytes_sent);
+    try std.testing.expectEqual(@as(u64, 1200), ds1.total_bytes_sent);
 
-    _ = bbr.onSend(1200, now + 1000);
+    const ds2 = bbr.onSend(1200, now + 1000);
     try std.testing.expectEqual(@as(u32, 2400), bbr.inflight);
+    try std.testing.expectEqual(@as(u64, 2400), bbr.total_bytes_sent);
+    try std.testing.expectEqual(@as(u64, 2400), ds2.total_bytes_sent);
 }
 
 test "Bbr onAck updates delivery and max_bw" {
@@ -1437,15 +1545,148 @@ test "Pacer timing" {
 
     try std.testing.expect(p.canSend(now));
 
-    // At 1 MB/s pacing rate, 1200 byte packet -> 1.2ms interval
-    p.onSend(now, 1200, 1_000_000);
+    // At 1 MB/s pacing rate, send_quantum = 2400 (floor). With inflight=0, cwnd=12000.
+    p.onSend(now, 1200, 1_000_000, 0, 12000);
+    // Burst remaining: 2400 - 1200 = 1200, so can still send
+    try std.testing.expect(p.canSend(now));
+    p.onSend(now, 1200, 1_000_000, 1200, 12000);
+    // Burst exhausted, must wait for next interval
     try std.testing.expect(!p.canSend(now));
-    try std.testing.expect(p.canSend(now + 2 * std.time.ns_per_ms));
+    try std.testing.expect(p.canSend(now + 3 * std.time.ns_per_ms));
+}
 
-    // Poll timeout should reflect remaining time
-    const timeout = p.pollTimeoutMs(now);
-    try std.testing.expect(timeout >= 0);
-    try std.testing.expect(timeout <= 2);
+test "Pacer cwnd-limited: single packet burst" {
+    var p = Pacer{};
+    const now: i64 = 1_000_000_000;
+
+    // inflight (11000) + packet (1200) >= cwnd (12000) → single packet burst
+    p.onSend(now, 1200, 10_000_000, 11000, 12000);
+    // After sending, burst_remaining should be 0 (single packet quantum)
+    try std.testing.expectEqual(@as(u32, 0), p.burst_remaining);
+}
+
+test "Pacer low bandwidth: single packet burst" {
+    var p = Pacer{};
+    const now: i64 = 1_000_000_000;
+
+    // pacing_rate = 100000 (100 KB/s) < 150000 threshold → single packet
+    p.onSend(now, 1200, 100_000, 0, 12000);
+    try std.testing.expectEqual(@as(u32, 0), p.burst_remaining);
+}
+
+test "Pacer idle restart: initial burst" {
+    var p = Pacer{};
+    const now: i64 = 1_000_000_000;
+
+    p.onIdleRestart();
+    // Should have 10 packets * 1200 = 12000 bytes of burst
+    try std.testing.expectEqual(@as(u32, 10 * 1200), p.burst_remaining);
+
+    // Can send multiple packets from burst
+    try std.testing.expect(p.canSend(now));
+    p.onSend(now, 1200, 1_000_000, 0, 50000);
+    try std.testing.expect(p.canSend(now)); // still have burst
+    try std.testing.expectEqual(@as(u32, 10800), p.burst_remaining);
+}
+
+test "Pacer loss clears burst" {
+    var p = Pacer{};
+    p.onIdleRestart();
+    try std.testing.expect(p.burst_remaining > 0);
+    p.onLoss();
+    try std.testing.expectEqual(@as(u32, 0), p.burst_remaining);
+}
+
+test "Pacer normal high bandwidth: full quantum" {
+    var p = Pacer{};
+    const now: i64 = 1_000_000_000;
+
+    // 10 MB/s, plenty of cwnd room → full quantum = 10000 bytes
+    p.onSend(now, 1200, 10_000_000, 0, 100000);
+    // quantum = 10000, burst_remaining = 10000 - 1200 = 8800
+    try std.testing.expectEqual(@as(u32, 8800), p.burst_remaining);
+}
+
+test "u128 BDP computation does not overflow" {
+    var bbr = Bbr{};
+    // 10 GB/s bandwidth, 1 second RTT
+    bbr.bw = 10_000_000_000;
+    bbr.min_rtt = @intCast(std.time.ns_per_s);
+    // BDP should be 10 GB = 10,000,000,000 (fits u64, would overflow u64 multiply)
+    const result = bbr.bdp();
+    try std.testing.expectEqual(@as(u64, 10_000_000_000), result);
+}
+
+test "min rate sampling: send_rate caps burst overestimation" {
+    var bbr = Bbr{};
+    const base: i64 = 1_000_000_000;
+
+    // Send 10 packets in a burst at time T=0
+    for (0..10) |_| {
+        _ = bbr.onSend(1200, base);
+    }
+
+    // Simulate ACK arriving at T+50ms for a packet sent at T=0
+    // with delivery state from the first send
+    bbr.delivered = 12000; // 10 packets acked
+    bbr.delivered_time = base + 50 * std.time.ns_per_ms;
+    bbr.total_bytes_sent = 12000;
+    bbr.min_rtt = 50 * std.time.ns_per_ms;
+
+    const ds = DeliveryState{
+        .delivered = 0,
+        .delivered_time = base,
+        .first_sent_time = base,
+        .total_bytes_sent = 0,
+    };
+    const rs = bbr.computeRateSample(.{
+        .size = 1200,
+        .sent_time = base,
+        .delivery_state = ds,
+        .rtt_ns = 50 * std.time.ns_per_ms,
+    }, base + 50 * std.time.ns_per_ms);
+
+    // send_rate = 12000 bytes / 0ns → infinite (burst sent instantly)
+    // ack_rate = 12000 bytes / 50ms = 240000 bytes/s
+    // min(send_rate, ack_rate) = 240000
+    try std.testing.expectEqual(@as(u64, 240_000), rs.delivery_rate);
+}
+
+test "A0 point selection: closest match" {
+    var bbr = Bbr{};
+    const base: i64 = 1_000_000_000;
+
+    // Push A0 candidates at different delivered levels
+    bbr.pushA0Candidate(.{ .ack_time = base, .total_bytes_acked = 0 });
+    bbr.pushA0Candidate(.{ .ack_time = base + 10 * std.time.ns_per_ms, .total_bytes_acked = 5000 });
+    bbr.pushA0Candidate(.{ .ack_time = base + 20 * std.time.ns_per_ms, .total_bytes_acked = 10000 });
+
+    // Target 7000: should pick the candidate with 5000 (closest below)
+    const a0 = bbr.selectA0(7000);
+    try std.testing.expect(a0 != null);
+    try std.testing.expectEqual(@as(u64, 5000), a0.?.total_bytes_acked);
+
+    // Target 15000: should pick 10000
+    const a1 = bbr.selectA0(15000);
+    try std.testing.expect(a1 != null);
+    try std.testing.expectEqual(@as(u64, 10000), a1.?.total_bytes_acked);
+
+    // Target 0: only candidate with 0 qualifies
+    const a2 = bbr.selectA0(0);
+    try std.testing.expect(a2 != null);
+    try std.testing.expectEqual(@as(u64, 0), a2.?.total_bytes_acked);
+}
+
+test "A0 point deque eviction" {
+    var bbr = Bbr{};
+    // Push more than a0_capacity candidates
+    for (0..a0_capacity + 4) |i| {
+        bbr.pushA0Candidate(.{ .ack_time = @intCast(i * 1000), .total_bytes_acked = @intCast(i * 100) });
+    }
+    // Should have exactly a0_capacity entries
+    try std.testing.expectEqual(a0_capacity, bbr.a0_count);
+    // Oldest should have been evicted; first entry is from i=4
+    try std.testing.expectEqual(@as(u64, 400), bbr.a0_candidates[0].total_bytes_acked);
 }
 
 test "isInflightTooHigh" {

@@ -369,6 +369,13 @@ pub const Gateway = struct {
             return;
         }
 
+        // Grant initial burst when transitioning from idle to active
+        if (self.bbr.inflight == 0 and
+            (self.pending_output.items.len > 0 or self.retransmit_queue.items.len > 0))
+        {
+            self.pacer.onIdleRestart();
+        }
+
         while (self.bbr.canSend() and self.pacer.canSend(now)) {
             // Priority 1: retransmissions
             if (self.retransmit_queue.items.len > 0) {
@@ -400,7 +407,7 @@ pub const Gateway = struct {
                 entry.sent_time = now;
                 // Re-increment inflight: onLoss decremented it, retransmit puts it back
                 self.bbr.inflight +|= @as(u32, @intCast(payload.len));
-                self.pacer.onSend(now, @intCast(payload.len), self.bbr.pacing_rate);
+                self.pacer.onSend(now, @intCast(payload.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
                 continue;
             }
 
@@ -434,7 +441,7 @@ pub const Gateway = struct {
                 return err;
             };
 
-            self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate);
+            self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
             self.output_offset +%= transport.step;
 
             // Remove sent data from pending buffer
@@ -529,12 +536,14 @@ pub const Gateway = struct {
         self.loss_time = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
         // Only notify BBR about NEWLY detected losses (not already-queued ones)
-        for (self.retransmit_queue.items[prev_queue_len..]) |lost_offset| {
-            if (self.send_buf.getForRetransmit(lost_offset)) |entry| {
-                // RS.lost = C.lost - P.lost (cumulative lost since this packet was sent)
-                const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
-                self.bbr.onLoss(lost_offset, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
+        if (self.retransmit_queue.items.len > prev_queue_len) {
+            for (self.retransmit_queue.items[prev_queue_len..]) |lost_offset| {
+                if (self.send_buf.getForRetransmit(lost_offset)) |entry| {
+                    const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
+                    self.bbr.onLoss(lost_offset, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
+                }
             }
+            self.pacer.onLoss();
         }
 
         self.setLossDetectionTimer(now);
@@ -589,11 +598,14 @@ pub const Gateway = struct {
         const prev_queue_len = self.retransmit_queue.items.len;
         self.loss_time = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
-        for (self.retransmit_queue.items[prev_queue_len..]) |lost_offset| {
-            if (self.send_buf.getForRetransmit(lost_offset)) |entry| {
-                const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
-                self.bbr.onLoss(lost_offset, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
+        if (self.retransmit_queue.items.len > prev_queue_len) {
+            for (self.retransmit_queue.items[prev_queue_len..]) |lost_offset| {
+                if (self.send_buf.getForRetransmit(lost_offset)) |entry| {
+                    const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
+                    self.bbr.onLoss(lost_offset, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
+                }
             }
+            self.pacer.onLoss();
         }
 
         self.setLossDetectionTimer(now);
@@ -1032,4 +1044,132 @@ test "integration: BBR paced output delivery with simulated loss" {
 
     // Verify BBR moved past startup
     try std.testing.expect(gw.bbr.pacing_rate > 0);
+}
+
+test "integration: sequential image-like bursts with loss" {
+    // Simulates yazi scrolling through image previews: multiple 50KB bursts
+    // with idle gaps between them, under 5% packet loss.
+    const alloc = std.testing.allocator;
+    const key = crypto.generateKey();
+
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    const daemon_write_fd = pair[0];
+    const gateway_read_fd = pair[1];
+    defer posix.close(daemon_write_fd);
+
+    var server_udp = try testBindLoopback(61300, 61400);
+    defer server_udp.close();
+    var client_udp = try testBindLoopback(61400, 61500);
+    defer client_udp.close();
+
+    var gw = try Gateway.initForTest(alloc, server_udp, gateway_read_fd, key);
+    defer gw.deinit();
+    gw.peer.addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, client_udp.bound_port);
+
+    var client_peer = udp.Peer.init(key, .to_server);
+    client_peer.addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, server_udp.bound_port);
+    var output_recv = transport.OutputRecvState{};
+    var output_ack_tracker = loss.OutputAckTracker{};
+    var received_data = try std.ArrayList(u8).initCapacity(alloc, 256 * 1024);
+    defer received_data.deinit(alloc);
+
+    // Generate 4 "image" bursts of 50KB each = 200KB total
+    const burst_size = 50 * 1024;
+    const num_bursts = 4;
+    const total_len = burst_size * num_bursts;
+    var test_data: [total_len]u8 = undefined;
+    for (&test_data, 0..) |*b, i| b.* = @truncate(i);
+
+    // Write all bursts as daemon Output IPC messages
+    {
+        var off: usize = 0;
+        while (off < total_len) {
+            const end = @min(off + 512, total_len);
+            var msg_buf: [1024]u8 = undefined;
+            const msg = transport.buildIpcBytes(.Output, test_data[off..end], &msg_buf);
+            _ = posix.write(daemon_write_fd, msg) catch break;
+            off = end;
+        }
+    }
+
+    var drop_rng: u64 = 0xabcdef0123456789;
+    const drop_pct: u64 = 5;
+    var iterations: u32 = 0;
+
+    while (iterations < 8000) : (iterations += 1) {
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+
+        // Server side
+        while (gw.unix_read_buf.read(gw.unix_fd) catch |err| blk: {
+            if (err == error.WouldBlock) break :blk @as(usize, 0);
+            break :blk @as(usize, 0);
+        } > 0) {}
+        while (gw.unix_read_buf.next()) |msg| {
+            gw.forwardDaemonMessage(msg.header.tag, msg.payload, now) catch {};
+        }
+
+        if (gw.loss_time > 0 and now >= gw.loss_time) gw.onLossDetectionTimeout(now);
+        if (gw.pto_time > 0 and now >= gw.pto_time) gw.onPtoTimeout(now);
+
+        gw.sendPacedOutput(now) catch {};
+
+        // Client side: receive with loss
+        while (true) {
+            var decrypt_buf: [9000]u8 = undefined;
+            const recv_result = client_peer.recv(&client_udp, &decrypt_buf) catch break;
+            const result = recv_result orelse break;
+
+            drop_rng ^= drop_rng << 13;
+            drop_rng ^= drop_rng >> 7;
+            drop_rng ^= drop_rng << 17;
+            if (drop_rng % 100 < drop_pct) continue;
+
+            const packet = transport.parsePacket(result.data) catch continue;
+            if (packet.channel == .output) {
+                switch (output_recv.onPacket(packet.seq, packet.payload)) {
+                    .delivered => {
+                        output_ack_tracker.onRecv(packet.seq);
+                        const deliveries = output_recv.deliverSlice();
+                        for (1..deliveries.len()) |di| {
+                            output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)) *% transport.step);
+                        }
+                        for (0..deliveries.len()) |i| {
+                            const p = deliveries.get(i);
+                            if (p.len > 0) try received_data.appendSlice(alloc, p);
+                        }
+                    },
+                    .buffered => output_ack_tracker.onRecv(packet.seq),
+                    .gap_resync, .duplicate, .stale => {},
+                }
+            }
+        }
+
+        // Client ACK heartbeat
+        if (output_ack_tracker.has_received) {
+            var gap_buf: [loss.AckRanges.max_gaps]loss.AckRanges.Gap = undefined;
+            const ranges = output_ack_tracker.generateAckRanges(&gap_buf);
+            var ack_payload_buf: [128]u8 = undefined;
+            const ack_payload = ranges.encode(&ack_payload_buf) catch "";
+            var pkt_buf: [1200]u8 = undefined;
+            const pkt = transport.buildUnreliable(.heartbeat, 0, 0, 0, ack_payload, &pkt_buf) catch continue;
+            client_peer.send(&client_udp, pkt) catch {};
+        }
+
+        // Server receives heartbeats
+        while (true) {
+            var decrypt_buf: [9000]u8 = undefined;
+            const recv_result = gw.peer.recv(&gw.udp_sock, &decrypt_buf) catch break;
+            const result = recv_result orelse break;
+            gw.handleTransportPacket(result.data, now) catch {};
+        }
+
+        if (received_data.items.len >= total_len) break;
+    }
+
+    // All 200KB should arrive correctly
+    try std.testing.expect(received_data.items.len >= total_len);
+    try std.testing.expectEqualSlices(u8, &test_data, received_data.items[0..total_len]);
+
+    // Verify no excessive loss was reported
+    try std.testing.expect(gw.bbr.total_lost < total_len / 2);
 }
