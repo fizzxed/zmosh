@@ -9,6 +9,9 @@ const builtin = @import("builtin");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_stdout_buf = 16 * 1024 * 1024;
+// Client ACK delay: how long to wait before sending output ACKs.
+// Must stay in sync with max_ack_delay_ns in loss.zig (the server's loss
+// detector accounts for this delay to avoid spurious retransmits).
 const ack_delay_ns = 5 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 

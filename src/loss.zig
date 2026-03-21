@@ -211,12 +211,21 @@ pub const LossDetector = struct {
     ) i64 {
         if (!self.has_largest_acked) return 0;
 
-        // Time threshold: max of the standard 9/8 multiplier and SRTT + 4*RTTVAR.
-        // The latter accounts for RTT variance and ACK processing delay, similar
-        // to QUIC's PTO formula (RFC 9002 §6.2.1). Without this, packets are
-        // declared lost before ACKs can realistically arrive.
+        // RFC 9002 §6.1.2 time threshold + §6.2.1 PTO with max_ack_delay.
+        //
+        // In TCP, BBR delegates loss detection to RACK which has per-packet
+        // timestamps and immediate ACKs. In QUIC (and our protocol), ACKs are
+        // delayed/batched, so the loss timer must account for the peer's
+        // max_ack_delay. Without this, packets are declared lost before the
+        // ACK can realistically arrive.
+        //
+        // Formula: loss_delay = max(
+        //   9/8 * max(srtt, latest_rtt),          -- RFC 9002 §6.1.2
+        //   srtt + max(4 * rttvar, max_ack_delay)  -- RFC 9002 §6.2.1 PTO
+        // )
+        const max_ack_delay_ns: i64 = 5 * std.time.ns_per_ms; // matches client ack_delay_ns
         const time_thresh = @divFloor(time_threshold_num * @max(srtt_ns, latest_rtt_ns), time_threshold_den);
-        const pto_thresh = srtt_ns + 4 * @max(rttvar_ns, std.time.ns_per_ms);
+        const pto_thresh = srtt_ns + @max(4 * @max(rttvar_ns, std.time.ns_per_ms), max_ack_delay_ns);
         const loss_delay = @max(time_thresh, pto_thresh);
         var earliest_loss_time: i64 = 0;
 
