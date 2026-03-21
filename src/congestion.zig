@@ -541,13 +541,14 @@ pub const Bbr = struct {
             };
         }
 
-        // Compute two independent rates; take the minimum (Google/Cloudflare approach)
+        // Compute two independent rates; take the minimum (Google/Cloudflare approach).
+        // Use u128 intermediates to prevent overflow (bytes * 1e9 can exceed u64).
         const send_rate: u64 = if (send_elapsed > 0)
-            send_bytes_delta * ns_per_s / @as(u64, @intCast(send_elapsed))
+            @intCast(@as(u128, send_bytes_delta) * ns_per_s / @as(u128, @intCast(send_elapsed)))
         else
             max_u64;
         const ack_rate: u64 = if (ack_elapsed > 0)
-            ack_bytes_delta * ns_per_s / @as(u64, @intCast(ack_elapsed))
+            @intCast(@as(u128, ack_bytes_delta) * ns_per_s / @as(u128, @intCast(ack_elapsed)))
         else
             max_u64;
         const rate = @min(send_rate, ack_rate);
