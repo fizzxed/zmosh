@@ -171,6 +171,7 @@ fn sendHeartbeat(
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     now: i64,
+    debug_log: ?std.fs.File,
 ) !void {
     // Encode output ACK ranges as heartbeat payload
     var gap_buf: [loss.AckRanges.max_gaps]loss.AckRanges.Gap = undefined;
@@ -181,6 +182,15 @@ fn sendHeartbeat(
         ranges.encode(&ack_payload_buf) catch ""
     else
         "";
+
+    if (ack_payload.len > 0) {
+        debugWrite(debug_log, "HB_ACK largest={d} first_range={d} gaps={d} payload_len={d}\n", .{
+            ranges.largest_acked,
+            ranges.first_range,
+            ranges.gaps.len,
+            ack_payload.len,
+        });
+    }
 
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
@@ -342,6 +352,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var ack_dirty = false;
     var last_resync_request_ns: i64 = 0;
     var last_stats_dump_ns: i64 = 0;
+    var output_pkts_this_interval: u64 = 0;
+    var last_output_pkt_ns: i64 = 0;
 
     // Send Init message with terminal size (reliable)
     const size = getTerminalSize();
@@ -351,18 +363,6 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
     while (true) {
         const now: i64 = @intCast(std.time.nanoTimestamp());
-
-        // Periodic debug stats dump
-        if (now - last_stats_dump_ns >= 2 * std.time.ns_per_s) {
-            debugWrite(debug_log, "stats: delivered={d} buffered={d} gap_resync={d} max_reorder={d} stdout_buf={d}\n", .{
-                output_recv.delivered_total,
-                output_recv.buffered_total,
-                output_recv.gap_resync_total,
-                output_recv.max_reorder_dist,
-                stdout_buf.items.len,
-            });
-            last_stats_dump_ns = now;
-        }
 
         // Check SIGWINCH
         if (sigwinch_received.swap(false, .acq_rel)) {
@@ -379,9 +379,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
         // Ack heartbeat + keepalive heartbeat.
         if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &last_ack_send_ns, &ack_dirty, now, debug_log) catch {};
         } else if (peer.shouldSendHeartbeat(now, config)) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &last_ack_send_ns, &ack_dirty, now, debug_log) catch {};
         }
 
         // State check
@@ -414,6 +414,28 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
         }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
+
+        // Periodic debug stats dump (placed here so poll_timeout is visible)
+        if (now - last_stats_dump_ns >= 2 * std.time.ns_per_s) {
+            const srtt_ms = if (peer.srtt_us) |s| @divFloor(s, 1000) else @as(i64, -1);
+            const since_last_pkt_ms = if (last_output_pkt_ns > 0) @divFloor(now - last_output_pkt_ns, std.time.ns_per_ms) else @as(i64, -1);
+            debugWrite(debug_log, "stats: delivered={d} buffered={d} gap_resync={d} max_reorder={d} stdout_buf={d} expected={d} ack_largest={d} srtt_ms={d} pkts_2s={d} since_last_ms={d} poll_ms={d} ack_dirty={}\n", .{
+                output_recv.delivered_total,
+                output_recv.buffered_total,
+                output_recv.gap_resync_total,
+                output_recv.max_reorder_dist,
+                stdout_buf.items.len,
+                output_recv.expected,
+                output_ack_tracker.largest_recv,
+                srtt_ms,
+                output_pkts_this_interval,
+                since_last_pkt_ms,
+                poll_timeout,
+                ack_dirty,
+            });
+            output_pkts_this_interval = 0;
+            last_stats_dump_ns = now;
+        }
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
             if (err == error.Interrupted) continue;
@@ -484,18 +506,33 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                         }
                     },
                     .output => {
-                        switch (output_recv.onPacket(packet.seq, packet.payload)) {
+                        output_pkts_this_interval += 1;
+                        last_output_pkt_ns = now;
+                        const action = output_recv.onPacket(packet.seq, packet.payload);
+                        debugWrite(debug_log, "OUT seq={d} len={d} action={s} expected={d}\n", .{
+                            packet.seq,
+                            packet.payload.len,
+                            switch (action) {
+                                .delivered => "delivered",
+                                .buffered => "buffered",
+                                .duplicate => "duplicate",
+                                .stale => "stale",
+                                .gap_resync => "gap_resync",
+                            },
+                            output_recv.expected,
+                        });
+                        switch (action) {
                             .delivered => {
                                 output_ack_tracker.onRecv(packet.seq);
                                 ack_dirty = true;
                                 const deliveries = output_recv.deliverSlice();
                                 if (deliveries.len() > 1) {
                                     debugWrite(debug_log, "REORDER_RECOVERY count={d}\n", .{deliveries.len()});
-                                    // Track ACKs for all delivered buffered packets too
                                     for (1..deliveries.len()) |di| {
                                         output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)));
                                     }
                                 }
+                                var deliver_bytes: usize = 0;
                                 for (0..deliveries.len()) |i| {
                                     const p = deliveries.get(i);
                                     if (p.len == 0) continue;
@@ -506,7 +543,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                         break;
                                     }
                                     try stdout_buf.appendSlice(alloc, p);
+                                    deliver_bytes += p.len;
                                 }
+                                debugWrite(debug_log, "DELIVER count={d} bytes={d} stdout_buf={d}\n", .{ deliveries.len(), deliver_bytes, stdout_buf.items.len });
                             },
                             .buffered => {
                                 output_ack_tracker.onRecv(packet.seq);
