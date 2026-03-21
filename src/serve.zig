@@ -449,8 +449,10 @@ pub const Gateway = struct {
             // Priority 2: new data from pending_output
             if (self.pending_output.items.len == 0) break;
 
-            // Flow control: stop sending when output_offset would exceed client's advertised window
-            if (self.output_offset -% self.client_max_offset < 0x80000000) break;
+            // Flow control: stop if output_offset is at or beyond client's window.
+            // "room available" = client_max_offset is ahead of output_offset.
+            const flow_room = self.client_max_offset -% self.output_offset;
+            if (flow_room == 0 or flow_room >= 0x80000000) break;
 
             const end = @min(transport.max_payload_len, self.pending_output.items.len);
             const chunk = self.pending_output.items[0..end];
