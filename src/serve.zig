@@ -207,8 +207,15 @@ pub const Gateway = struct {
             .last_resize = .{ .rows = 24, .cols = 80 },
         };
         gw.retransmit_queue = std.ArrayListUnmanaged(u32).initBuffer(&gw.retransmit_buf);
+        // Cap BBR's cwnd to the receiver's UDP socket buffer. Since both
+        // sides run the same binary with the same buffer request, the local
+        // buffer is a good proxy. Linux doubles the setsockopt value (half
+        // for kernel overhead), so usable capacity ≈ raw_size / 2.
+        const recv_buf = udp.UdpSocket.getRecvBufSize(udp_sock.fd);
+        gw.bbr.max_cwnd = recv_buf / 2;
+
         gw.debug_log = std.fs.createFileAbsolute("/tmp/zmosh-server-debug.log", .{ .truncate = true }) catch null;
-        debugWrite(gw.debug_log, "zmosh server debug started\n", .{});
+        debugWrite(gw.debug_log, "zmosh server debug started max_cwnd={d}\n", .{gw.bbr.max_cwnd});
         return gw;
     }
 

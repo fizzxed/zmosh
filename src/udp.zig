@@ -46,6 +46,18 @@ pub const UdpSocket = struct {
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&size)) catch {};
     }
 
+    /// Query the actual receive buffer the kernel granted (may be less than
+    /// requested if rmem_max is low). Returns the size in bytes, or a
+    /// conservative default if the query fails. Note: Linux doubles the
+    /// setsockopt value (half is for kernel overhead), so the usable
+    /// space is approximately the returned value / 2.
+    pub fn getRecvBufSize(fd: posix.fd_t) u32 {
+        var size: i32 = 0;
+        var len: u32 = @sizeOf(i32);
+        const rc = std.os.linux.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&size), &len);
+        return if (rc == 0 and size > 0) @intCast(size) else 212992; // fallback = default rmem
+    }
+
     fn bindFamily(family: u32, port_start: u16, port_end: u16, set_v6only: bool) ?UdpSocket {
         const fd = posix.socket(
             family,

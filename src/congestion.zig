@@ -223,6 +223,10 @@ pub const Bbr = struct {
     // = 12000 / 0.001 * (709/256) = 12,000,000 * 2.77 ≈ 33,234,375
     pacing_rate: u64 = @as(u64, initial_cwnd) * ns_per_s / std.time.ns_per_ms * startup_pacing_gain / 256,
     cwnd: u32 = initial_cwnd,
+    /// Hard ceiling for cwnd, set from the receiver's UDP socket buffer size.
+    /// Prevents inflight from exceeding what the receiver's kernel can buffer
+    /// between poll() wakeups. Default = no cap.
+    max_cwnd: u32 = max_u32,
     inflight: u32 = 0,
 
     // --- Delivery tracking ---
@@ -1327,6 +1331,7 @@ pub const Bbr = struct {
         }
 
         self.cwnd = @max(self.cwnd, min_cwnd);
+        self.cwnd = @min(self.cwnd, self.max_cwnd);
         self.boundCwndForProbeRTT();
         self.boundCwndForModel();
     }
