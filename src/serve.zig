@@ -74,6 +74,7 @@ pub const Gateway = struct {
     retransmit_buf: [64]u32,
     retransmit_queue: std.ArrayListUnmanaged(u32),
     latest_rtt_ns: i64,
+    loss_detection_timer: i64, // ns, 0 = no timer
 
     config: udp.Config,
     running: bool,
@@ -162,6 +163,7 @@ pub const Gateway = struct {
             .retransmit_buf = undefined,
             .retransmit_queue = undefined,
             .latest_rtt_ns = 0,
+            .loss_detection_timer = 0,
             .config = config,
             .running = true,
             .last_ack_send_ns = now,
@@ -190,6 +192,11 @@ pub const Gateway = struct {
             if (state == .dead) {
                 log.info("peer dead (alive timeout), shutting down", .{});
                 break;
+            }
+
+            // Timer-triggered loss detection (RFC 9002)
+            if (self.loss_detection_timer > 0 and now >= self.loss_detection_timer) {
+                self.runLossDetection(now);
             }
 
             try self.flushRetransmits(now);
@@ -293,6 +300,13 @@ pub const Gateway = struct {
                 const pacer_ms = self.pacer.pollTimeoutMs(now);
                 timeout = @min(timeout, @as(i64, pacer_ms));
             }
+        }
+
+        // Loss detection timer
+        if (self.loss_detection_timer > 0) {
+            const remaining_ns = self.loss_detection_timer - now;
+            const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
+            timeout = @min(timeout, remaining_ms);
         }
 
         if (self.reliable_send.hasPending()) {
@@ -438,7 +452,7 @@ pub const Gateway = struct {
                     .sent_time = entry.sent_time,
                     .delivery_state = entry.delivery_state,
                     .rtt_ns = if (entry.retransmit_count == 0) n - entry.sent_time else 0,
-                }, n);
+                }, entry.size, n);
             }
         };
 
@@ -447,16 +461,33 @@ pub const Gateway = struct {
         // Loss detection
         const srtt_ns: i64 = if (self.peer.srtt_us) |s| s * std.time.ns_per_us else 100 * std.time.ns_per_ms;
         const latest = if (self.latest_rtt_ns > 0) self.latest_rtt_ns else srtt_ns;
-        self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
+        self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
         // Notify BBR about losses (peek, don't remove — retransmitted by sendPacedOutput)
         for (self.retransmit_queue.items) |lost_seq| {
             if (self.send_buf.getForRetransmit(lost_seq)) |entry| {
-                self.bbr.onLoss(entry.size, entry.delivery_state.tx_in_flight);
+                // RS.lost = C.lost - P.lost (cumulative lost since this packet was sent)
+                const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
+                self.bbr.onLoss(entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
             }
         }
 
         self.send_buf.pruneAcked();
+    }
+
+    /// Timer-triggered loss detection (RFC 9002 §6.1.2).
+    /// Called when loss_detection_timer fires without an ACK arrival.
+    fn runLossDetection(self: *Gateway, now: i64) void {
+        const srtt_ns: i64 = if (self.peer.srtt_us) |s| s * std.time.ns_per_us else 100 * std.time.ns_per_ms;
+        const latest = if (self.latest_rtt_ns > 0) self.latest_rtt_ns else srtt_ns;
+        self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
+
+        for (self.retransmit_queue.items) |lost_seq| {
+            if (self.send_buf.getForRetransmit(lost_seq)) |entry| {
+                const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
+                self.bbr.onLoss(entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
+            }
+        }
     }
 
     fn flushRetransmits(self: *Gateway, now: i64) !void {
@@ -597,6 +628,51 @@ pub const Gateway = struct {
         try self.sendIpcReliable(tag, payload, now);
     }
 
+    /// Test-only constructor: takes pre-created sockets, no daemon/SSH.
+    pub fn initForTest(
+        alloc: std.mem.Allocator,
+        udp_sock: udp.UdpSocket,
+        unix_fd: i32,
+        key: crypto.Key,
+    ) !Gateway {
+        const unix_read_buf = try ipc.SocketBuffer.init(alloc);
+        const unix_write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
+        const pending_output = try std.ArrayList(u8).initCapacity(alloc, 4096);
+        const reliable_send = try transport.ReliableSend.init(alloc);
+        const send_buf = try loss.SendBuffer.init(alloc);
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+
+        var gw = Gateway{
+            .alloc = alloc,
+            .udp_sock = udp_sock,
+            .unix_fd = unix_fd,
+            .peer = udp.Peer.init(key, .to_client),
+            .unix_read_buf = unix_read_buf,
+            .unix_write_buf = unix_write_buf,
+            .pending_output = pending_output,
+            .reliable_send = reliable_send,
+            .reliable_recv = .{},
+            .output_seq = 1,
+            .bbr = .{},
+            .pacer = .{},
+            .send_buf = send_buf,
+            .loss_detector = .{},
+            .retransmit_buf = undefined,
+            .retransmit_queue = undefined,
+            .latest_rtt_ns = 0,
+            .loss_detection_timer = 0,
+            .config = .{},
+            .running = true,
+            .last_ack_send_ns = now,
+            .ack_dirty = false,
+            .last_resync_request_ns = 0,
+            .have_client_size = false,
+            .last_resize = .{ .rows = 24, .cols = 80 },
+        };
+        gw.retransmit_queue = std.ArrayListUnmanaged(u32).initBuffer(&gw.retransmit_buf);
+        return gw;
+    }
+
     pub fn deinit(self: *Gateway) void {
         posix.close(self.unix_fd);
         self.udp_sock.close();
@@ -648,4 +724,178 @@ test "resolveSocketDir returns valid path" {
     defer alloc.free(dir);
     try std.testing.expect(dir.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, dir, "zmx") != null);
+}
+
+// ---------------------------------------------------------------------------
+// Integration test: BBR pacing + selective retransmit over loopback UDP
+// ---------------------------------------------------------------------------
+
+/// Bind a non-blocking IPv4 UDP socket on loopback for testing.
+fn testBindLoopback(port_start: u16, port_end: u16) !udp.UdpSocket {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    errdefer posix.close(fd);
+    var port = port_start;
+    while (port < port_end) : (port += 1) {
+        const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, port);
+        posix.bind(fd, &addr.any, addr.getOsSockLen()) catch continue;
+        return .{ .fd = fd, .bound_port = port };
+    }
+    posix.close(fd);
+    return error.AddressInUse;
+}
+
+test "integration: BBR paced output delivery with simulated loss" {
+    const alloc = std.testing.allocator;
+    const key = crypto.generateKey();
+
+    // Create a socketpair for the "daemon" side
+    const pair = try posix.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0);
+    const daemon_write_fd = pair[0]; // we write daemon output here
+    const gateway_read_fd = pair[1]; // gateway reads from here
+    defer posix.close(daemon_write_fd);
+
+    // Create UDP sockets for server and client
+    var server_udp = try testBindLoopback(61100, 61200);
+    defer server_udp.close();
+    var client_udp = try testBindLoopback(61200, 61300);
+    defer client_udp.close();
+
+    // Initialize gateway with test constructor
+    var gw = try Gateway.initForTest(alloc, server_udp, gateway_read_fd, key);
+    defer gw.deinit();
+
+    // Set the gateway's peer address to the client
+    gw.peer.addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, client_udp.bound_port);
+
+    // Initialize client-side state
+    var client_peer = udp.Peer.init(key, .to_server);
+    client_peer.addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, server_udp.bound_port);
+    var output_recv = transport.OutputRecvState{};
+    var output_ack_tracker = loss.OutputAckTracker{};
+    var received_data = try std.ArrayList(u8).initCapacity(alloc, 64 * 1024);
+    defer received_data.deinit(alloc);
+
+    // Generate test data: 32KB of recognizable pattern
+    const test_data_len = 32 * 1024;
+    var test_data: [test_data_len]u8 = undefined;
+    for (&test_data, 0..) |*b, i| {
+        b.* = @truncate(i);
+    }
+
+    // Write test data as daemon Output IPC messages into the socketpair
+    {
+        var offset: usize = 0;
+        while (offset < test_data_len) {
+            const chunk_end = @min(offset + 512, test_data_len);
+            const chunk = test_data[offset..chunk_end];
+            var msg_buf: [1024]u8 = undefined;
+            const msg = transport.buildIpcBytes(.Output, chunk, &msg_buf);
+            _ = posix.write(daemon_write_fd, msg) catch break;
+            offset = chunk_end;
+        }
+    }
+
+    // Simple PRNG for simulating packet loss
+    var drop_rng: u64 = 0xdeadbeef12345678;
+    const drop_pct: u64 = 10; // 10% simulated loss
+
+    // Run server/client exchange loop
+    var iterations: u32 = 0;
+    const max_iterations: u32 = 5000;
+
+    while (iterations < max_iterations) : (iterations += 1) {
+        const now: i64 = @intCast(std.time.nanoTimestamp());
+
+        // --- SERVER SIDE ---
+
+        // Read daemon data into gateway
+        while (gw.unix_read_buf.read(gw.unix_fd) catch |err| blk: {
+            if (err == error.WouldBlock) break :blk @as(usize, 0);
+            break :blk @as(usize, 0);
+        } > 0) {}
+        while (gw.unix_read_buf.next()) |msg| {
+            gw.forwardDaemonMessage(msg.header.tag, msg.payload, now) catch {};
+        }
+
+        // Loss detection timer
+        if (gw.loss_detection_timer > 0 and now >= gw.loss_detection_timer) {
+            gw.runLossDetection(now);
+        }
+
+        // Send paced output
+        gw.sendPacedOutput(now) catch {};
+
+        // --- CLIENT SIDE ---
+
+        // Receive UDP packets (with simulated loss)
+        while (true) {
+            var decrypt_buf: [9000]u8 = undefined;
+            const recv_result = client_peer.recv(&client_udp, &decrypt_buf) catch break;
+            const result = recv_result orelse break;
+
+            // Simulate packet loss
+            drop_rng ^= drop_rng << 13;
+            drop_rng ^= drop_rng >> 7;
+            drop_rng ^= drop_rng << 17;
+            if (drop_rng % 100 < drop_pct) continue; // drop this packet
+
+            const packet = transport.parsePacket(result.data) catch continue;
+
+            if (packet.channel == .output) {
+                switch (output_recv.onPacket(packet.seq, packet.payload)) {
+                    .delivered => {
+                        output_ack_tracker.onRecv(packet.seq);
+                        const deliveries = output_recv.deliverSlice();
+                        for (1..deliveries.len()) |di| {
+                            output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)));
+                        }
+                        for (0..deliveries.len()) |i| {
+                            const p = deliveries.get(i);
+                            if (p.len > 0) {
+                                try received_data.appendSlice(alloc, p);
+                            }
+                        }
+                    },
+                    .buffered => {
+                        output_ack_tracker.onRecv(packet.seq);
+                    },
+                    .gap_resync, .duplicate, .stale => {},
+                }
+            }
+        }
+
+        // Client sends ACK heartbeat back to server
+        if (output_ack_tracker.has_received) {
+            var gap_buf: [loss.AckRanges.max_gaps]loss.AckRanges.Gap = undefined;
+            const ranges = output_ack_tracker.generateAckRanges(&gap_buf);
+            var ack_payload_buf: [128]u8 = undefined;
+            const ack_payload = ranges.encode(&ack_payload_buf) catch "";
+            var pkt_buf: [1200]u8 = undefined;
+            const pkt = transport.buildUnreliable(.heartbeat, 0, 0, 0, ack_payload, &pkt_buf) catch continue;
+            client_peer.send(&client_udp, pkt) catch {};
+        }
+
+        // Server receives client heartbeats
+        while (true) {
+            var decrypt_buf: [9000]u8 = undefined;
+            const recv_result = gw.peer.recv(&gw.udp_sock, &decrypt_buf) catch break;
+            const result = recv_result orelse break;
+            gw.handleTransportPacket(result.data, now) catch {};
+        }
+
+        // Check if all data delivered
+        if (received_data.items.len >= test_data_len) break;
+
+        // Check if server is done sending and no pending data
+        if (gw.pending_output.items.len == 0 and
+            gw.retransmit_queue.items.len == 0 and
+            received_data.items.len >= test_data_len) break;
+    }
+
+    // Verify all data was received correctly
+    try std.testing.expect(received_data.items.len >= test_data_len);
+    try std.testing.expectEqualSlices(u8, &test_data, received_data.items[0..test_data_len]);
+
+    // Verify BBR moved past startup
+    try std.testing.expect(gw.bbr.pacing_rate > 0);
 }

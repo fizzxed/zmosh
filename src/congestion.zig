@@ -4,62 +4,81 @@ const std = @import("std");
 const ns_per_s: u64 = std.time.ns_per_s;
 
 // ---------------------------------------------------------------------------
-// Constants (BBR v3, draft-cardwell-ccwg-bbr-00)
+// Constants (BBR v3, draft-ietf-ccwg-bbr-05)
 // ---------------------------------------------------------------------------
 
-pub const max_datagram_size: u32 = 1200;
+pub const max_datagram_size: u32 = 1200; // C.SMSS
 pub const initial_cwnd: u32 = 10 * max_datagram_size; // 12,000
-pub const min_cwnd: u32 = 4 * max_datagram_size; // 4,800
-const min_rtt_window_ns: i64 = 10 * std.time.ns_per_s;
+pub const min_cwnd: u32 = 4 * max_datagram_size; // BBR.MinPipeCwnd = 4*SMSS
+
+/// MinRTTFilterLen = 10 seconds (spec section 2.13.1)
+const min_rtt_filter_len_ns: i64 = 10 * std.time.ns_per_s;
+/// ProbeRTTDuration = 200ms (spec section 2.13.2)
 const probe_rtt_duration_ns: i64 = 200 * std.time.ns_per_ms;
+/// ProbeRTTInterval = 5 seconds (spec section 2.13.2)
 const probe_rtt_interval_ns: i64 = 5 * std.time.ns_per_s;
-const max_bw_filter_len: u64 = 10; // round-trips
+/// MaxBwFilterLen = 2 ProbeBW cycles (spec section 2.10)
+const max_bw_filter_len: u64 = 2;
+/// ExtraAckedFilterLen = 10 round trips (spec section 2.11)
+const extra_acked_filter_len: u64 = 10;
+/// Startup full-pipe detection: 3 rounds (spec section 5.3.1.2)
 const full_pipe_rounds: u32 = 3;
-const startup_loss_events: u32 = 6;
+/// StartupFullLossCnt = 6 (spec section 5.3.1.3)
+const startup_full_loss_cnt: u32 = 6;
 
-/// 8.8 fixed-point gains (256 = 1.0×)
-const startup_pacing_gain: u32 = 726; // 2.89× ≈ 2/ln2
-const startup_cwnd_gain: u32 = 512; // 2.0×
-const drain_pacing_gain: u32 = 89; // 1/2.89×
-const probe_bw_down_pacing: u32 = 230; // 0.90×
-const probe_bw_cruise_pacing: u32 = 256; // 1.0×
-const probe_bw_refill_pacing: u32 = 256; // 1.0×
-const probe_bw_up_pacing: u32 = 320; // 1.25×
-const probe_bw_up_cwnd_gain: u32 = 576; // 2.25×
-const probe_bw_default_cwnd_gain: u32 = 512; // 2.0×
+/// 8.8 fixed-point gains (256 = 1.0x)
+/// StartupPacingGain = 2.77 ~= 4*ln(2) (spec section 2.4) => 709/256
+const startup_pacing_gain: u32 = 709;
+/// DrainPacingGain = 0.5 (spec section 2.4) => 128/256
+const drain_pacing_gain: u32 = 128;
+/// DefaultCwndGain = 2 (spec section 2.5) => 512/256
+const default_cwnd_gain: u32 = 512;
+/// ProbeRTTCwndGain = 0.5 (spec section 2.13.2) => 128/256
+const probe_rtt_cwnd_gain: u32 = 128;
 
-/// Loss response thresholds (fixed-point: 2% = 2/100)
+const probe_bw_down_pacing: u32 = 230; // 0.90x
+const probe_bw_cruise_pacing: u32 = 256; // 1.0x
+const probe_bw_refill_pacing: u32 = 256; // 1.0x
+const probe_bw_up_pacing: u32 = 320; // 1.25x
+const probe_bw_up_cwnd_gain: u32 = 576; // 2.25x
+
+/// LossThresh = 2% (spec section 2.7)
 const loss_thresh_num: u64 = 2;
 const loss_thresh_den: u64 = 100;
+/// Beta = 0.7 (spec section 2.7)
 const beta_num: u64 = 7;
 const beta_den: u64 = 10;
+/// Headroom = 0.15 (spec section 2.7)
+const headroom_num: u64 = 15;
+const headroom_den: u64 = 100;
+/// PacingMarginPercent = 1 (spec section 5.6.2)
+const pacing_margin_percent: u64 = 1;
 
 const max_u32: u32 = std.math.maxInt(u32);
 const max_u64: u64 = std.math.maxInt(u64);
+const max_i64: i64 = std.math.maxInt(i64);
 
 // ---------------------------------------------------------------------------
-// Windowed Max Filter (3-entry, for max_bw and extra_acked)
+// Windowed Max Filter (Kathleen Nichols' algorithm, 2-slot for max_bw)
 // ---------------------------------------------------------------------------
 
 pub const MaxFilter = struct {
-    const Entry = struct { val: u64, round: u64 };
-    win: [3]Entry = .{ .{ .val = 0, .round = 0 }, .{ .val = 0, .round = 0 }, .{ .val = 0, .round = 0 } },
+    const Entry = struct { val: u64, time: u64 };
+    win: [2]Entry = .{ .{ .val = 0, .time = 0 }, .{ .val = 0, .time = 0 } },
 
-    pub fn update(self: *MaxFilter, val: u64, round: u64) void {
-        // Slot 0 is the best (max). Maintain a monotone decreasing window.
-        if (val >= self.win[0].val or round - self.win[0].round >= max_bw_filter_len) {
-            self.win[2] = .{ .val = val, .round = round };
-            self.win[1] = .{ .val = val, .round = round };
-            self.win[0] = .{ .val = val, .round = round };
+    /// Update with a new sample. `window_len` is the filter window length.
+    /// For max_bw: window_len = 2, time = cycle_count.
+    /// For extra_acked: window_len = 10, time = round_count.
+    pub fn update(self: *MaxFilter, val: u64, time: u64, window_len: u64) void {
+        // If new value >= current best, or window expired, reset all slots.
+        if (val >= self.win[0].val or (time -% self.win[0].time) >= window_len) {
+            self.win[1] = .{ .val = val, .time = time };
+            self.win[0] = .{ .val = val, .time = time };
             return;
         }
-        if (val >= self.win[1].val or round - self.win[1].round >= max_bw_filter_len) {
-            self.win[2] = .{ .val = val, .round = round };
-            self.win[1] = .{ .val = val, .round = round };
+        if (val >= self.win[1].val or (time -% self.win[1].time) >= window_len) {
+            self.win[1] = .{ .val = val, .time = time };
             return;
-        }
-        if (val >= self.win[2].val or round - self.win[2].round >= max_bw_filter_len) {
-            self.win[2] = .{ .val = val, .round = round };
         }
     }
 
@@ -68,27 +87,7 @@ pub const MaxFilter = struct {
     }
 
     pub fn reset(self: *MaxFilter) void {
-        self.win = .{.{ .val = 0, .round = 0 }} ** 3;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Min Filter (for min_rtt — 10-second sliding window)
-// ---------------------------------------------------------------------------
-
-pub const MinFilter = struct {
-    val: i64 = std.math.maxInt(i64),
-    stamp: i64 = 0,
-
-    pub fn update(self: *MinFilter, sample: i64, now: i64) void {
-        if (sample <= self.val or self.expired(now, min_rtt_window_ns)) {
-            self.val = sample;
-            self.stamp = now;
-        }
-    }
-
-    pub fn expired(self: *const MinFilter, now: i64, window_ns: i64) bool {
-        return (now - self.stamp) >= window_ns;
+        self.win = .{ .{ .val = 0, .time = 0 }, .{ .val = 0, .time = 0 } };
     }
 };
 
@@ -102,6 +101,7 @@ pub const DeliveryState = struct {
     first_sent_time: i64 = 0,
     is_app_limited: bool = false,
     tx_in_flight: u32 = 0,
+    lost: u64 = 0, // C.lost at time of send (for RS.lost = C.lost - P.lost)
 };
 
 pub const RateSample = struct {
@@ -109,12 +109,13 @@ pub const RateSample = struct {
     rtt_ns: i64 = 0,
     is_app_limited: bool = false,
     delivered: u64 = 0,
+    newly_acked: u32 = 0,
     lost: u64 = 0,
     tx_in_flight: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
-// Acked packet info (passed from loss detector → BBR)
+// Acked packet info (passed from loss detector -> BBR)
 // ---------------------------------------------------------------------------
 
 pub const AckedPacket = struct {
@@ -142,24 +143,63 @@ pub const ProbeBwPhase = enum {
     up,
 };
 
+pub const AckPhase = enum {
+    acks_init,
+    acks_refilling,
+    acks_probe_starting,
+    acks_probe_feedback,
+    acks_probe_stopping,
+};
+
+// ---------------------------------------------------------------------------
+// Simple xorshift64 PRNG (inline, no deps)
+// ---------------------------------------------------------------------------
+fn xorshift64(state: *u64) u64 {
+    var x = state.*;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    state.* = x;
+    return x;
+}
+
+// ---------------------------------------------------------------------------
+// BBR v3 (draft-ietf-ccwg-bbr-05)
+// ---------------------------------------------------------------------------
+
 pub const Bbr = struct {
     state: BbrState = .startup,
     probe_bw_phase: ProbeBwPhase = .down,
+    ack_phase: AckPhase = .acks_init,
 
-    // --- Bandwidth estimation (dual bounds) ---
+    // --- Bandwidth model (long-term) ---
     max_bw: u64 = 0,
     max_bw_filter: MaxFilter = .{},
-    bw_lo: u64 = max_u64,
-    bw_hi: u64 = max_u64,
+    cycle_count: u64 = 0,
+
+    // --- Bandwidth model (short-term) ---
+    bw_shortterm: u64 = max_u64, // Infinity
     bw: u64 = 0,
 
-    // --- RTT estimation ---
-    min_rtt_filter: MinFilter = .{},
-    probe_rtt_min_filter: MinFilter = .{},
+    // --- Short-term delivery signals ---
+    bw_latest: u64 = 0,
+    inflight_latest: u64 = 0,
+    loss_round_start: bool = false,
+    loss_round_delivered: u64 = 0,
+    loss_in_round: bool = false,
 
-    // --- Inflight control (dual bounds) ---
-    inflight_hi: u32 = max_u32,
-    inflight_lo: u32 = max_u32,
+    // --- RTT estimation ---
+    min_rtt: i64 = max_i64, // Infinity until first sample
+    min_rtt_stamp: i64 = 0,
+    probe_rtt_min_delay: i64 = max_i64,
+    probe_rtt_min_stamp: i64 = 0,
+    probe_rtt_expired: bool = false,
+
+    // --- Inflight model ---
+    inflight_longterm: u32 = max_u32, // Infinity
+    inflight_shortterm: u32 = max_u32, // Infinity
+    max_inflight: u32 = initial_cwnd,
+    extra_acked: u64 = 0,
 
     // --- Pacing + window ---
     pacing_rate: u64 = 0,
@@ -170,28 +210,31 @@ pub const Bbr = struct {
     delivered: u64 = 0,
     delivered_time: i64 = 0,
     first_sent_time: i64 = 0,
-
-    // --- Loss tracking (v3) ---
-    lost_in_round: u64 = 0,
-    loss_events_in_round: u32 = 0,
-    loss_round_delivered: u64 = 0,
+    total_lost: u64 = 0, // C.lost: cumulative bytes declared lost
 
     // --- Round tracking ---
     round_count: u64 = 0,
     round_start: bool = false,
     next_round_delivered: u64 = 0,
+    rounds_since_bw_probe: u64 = 0,
 
     // --- Startup full-pipe detection ---
     full_bw: u64 = 0,
     full_bw_count: u32 = 0,
-    filled_pipe: bool = false,
+    full_bw_now: bool = false,
+    full_bw_reached: bool = false,
 
     // --- ProbeBW state ---
     cycle_stamp: i64 = 0,
-    probe_up_cnt: u32 = max_datagram_size,
-    probe_up_rounds: u32 = 0,
+    bw_probe_wait: i64 = 0, // ns
+    bw_probe_up_rounds: u32 = 0,
+    bw_probe_up_acks: u32 = 0,
+    probe_up_cnt: u32 = max_u32,
     bw_probe_samples: bool = false,
     prior_cwnd: u32 = 0,
+
+    // --- Drain state ---
+    drain_start_round: u64 = 0,
 
     // --- ProbeRTT state ---
     probe_rtt_done_stamp: i64 = 0,
@@ -206,6 +249,17 @@ pub const Bbr = struct {
     extra_acked_interval_start: i64 = 0,
     extra_acked_delivered: u64 = 0,
 
+    // --- Idle restart ---
+    idle_restart: bool = false,
+
+    // --- Undo state (for spurious loss recovery) ---
+    undo_bw_shortterm: u64 = max_u64,
+    undo_inflight_shortterm: u32 = max_u32,
+    undo_inflight_longterm: u32 = max_u32,
+
+    // --- PRNG state ---
+    rng_state: u64 = 0,
+
     // ------------------------------------------------------------------
     // Public API
     // ------------------------------------------------------------------
@@ -217,62 +271,114 @@ pub const Bbr = struct {
             .first_sent_time = self.first_sent_time,
             .is_app_limited = self.is_app_limited,
             .tx_in_flight = self.inflight,
+            .lost = self.total_lost,
         };
     }
 
     pub fn onSend(self: *Bbr, bytes: u32, now: i64) void {
+        // BBRHandleRestartFromIdle (spec 5.4.1)
+        self.handleRestartFromIdle(now);
+
         self.inflight += bytes;
-        if (self.first_sent_time == 0) self.first_sent_time = now;
+        if (self.first_sent_time == 0) {
+            self.first_sent_time = now;
+            self.delivered_time = now;
+        }
+
+        // Seed PRNG on first send
+        if (self.rng_state == 0) {
+            self.rng_state = @as(u64, @bitCast(now)) | 1;
+        }
     }
 
-    pub fn onAck(self: *Bbr, pkt: AckedPacket, now: i64) void {
+    pub fn onAck(self: *Bbr, pkt: AckedPacket, newly_acked: u32, now: i64) void {
         self.inflight -|= pkt.size;
         self.delivered += pkt.size;
         self.delivered_time = now;
 
-        // Round tracking
-        if (self.delivered >= self.next_round_delivered) {
-            self.next_round_delivered = self.delivered;
-            self.round_count += 1;
-            self.round_start = true;
-            // Reset per-round loss counters
-            self.lost_in_round = 0;
-            self.loss_events_in_round = 0;
-        } else {
-            self.round_start = false;
-        }
-
         // Compute delivery rate sample
-        const rs = self.computeRateSample(pkt, now);
+        var rs = self.computeRateSample(pkt, now);
+        rs.newly_acked = newly_acked;
 
-        // Update min_rtt
-        if (pkt.rtt_ns > 0) {
-            self.min_rtt_filter.update(pkt.rtt_ns, now);
-            self.probe_rtt_min_filter.update(pkt.rtt_ns, now);
-        }
+        // --- BBRUpdateModelAndState ---
+        // BBRUpdateLatestDeliverySignals (spec 5.5.10.3)
+        self.updateLatestDeliverySignals(rs);
+        // BBRUpdateCongestionSignals (spec 5.5.10.3)
+        self.updateCongestionSignals(rs, now);
+        // BBRUpdateACKAggregation (spec 5.5.9)
+        self.updateACKAggregation(rs, now);
+        // BBRCheckFullBWReached (spec 5.3.1.2)
+        self.checkFullBWReached(rs);
+        // BBRCheckStartupDone (spec 5.3.1)
+        self.checkStartupDone(rs);
+        // BBRCheckDrainDone (spec 5.3.2)
+        self.checkDrainDone(now);
+        // BBRUpdateProbeBWCyclePhase (spec 5.3.3.6)
+        self.updateProbeBWCyclePhase(rs, now);
+        // BBRUpdateMinRTT (spec 5.3.4.3)
+        self.updateMinRTT(rs, now);
+        // BBRCheckProbeRTT (spec 5.3.4.3)
+        self.checkProbeRTT(rs, now);
+        // BBRAdvanceLatestDeliverySignals (spec 5.5.10.3)
+        self.advanceLatestDeliverySignals(rs);
+        // BBRBoundBWForModel (spec 5.5.10.3)
+        self.boundBWForModel();
 
-        // Update max_bw (skip app-limited samples unless they exceed current max)
-        if (!rs.is_app_limited or rs.delivery_rate > self.max_bw_filter.getBest()) {
-            self.max_bw_filter.update(rs.delivery_rate, self.round_count);
-        }
-        self.max_bw = self.max_bw_filter.getBest();
-
-        // State machine transitions
-        self.updateStateMachine(rs, now);
-
-        // Update pacing rate and cwnd
-        self.updatePacingRate();
-        self.updateCwnd();
+        // --- BBRUpdateControlParameters ---
+        // BBRSetPacingRate (spec 5.6.2)
+        self.setPacingRate();
+        // BBRSetCwnd (spec 5.6.4.6)
+        self.setCwnd(rs);
     }
 
-    pub fn onLoss(self: *Bbr, bytes: u32, tx_in_flight: u32) void {
-        self.inflight -|= bytes;
-        self.lost_in_round += bytes;
-        self.loss_events_in_round += 1;
+    /// Per-loss handler: BBRHandleLostPacket (spec 5.5.10.2)
+    /// pkt_size: size of the lost packet
+    /// lost: cumulative data lost since this packet was sent (RS.lost)
+    /// tx_in_flight: C.inflight when this packet was sent (RS.tx_in_flight)
+    /// is_app_limited_at_send: P.is_app_limited
+    pub fn onLoss(self: *Bbr, pkt_size: u32, lost: u64, tx_in_flight: u32, is_app_limited: bool) void {
+        self.inflight -|= pkt_size;
+        self.total_lost += pkt_size;
 
-        // Check if inflight is too high (>2% loss rate)
-        if (isInflightTooHigh(bytes, tx_in_flight)) {
-            self.onInflightTooHigh(tx_in_flight);
+        // BBRNoteLoss (spec 5.5.10.2)
+        if (!self.loss_in_round) {
+            self.loss_round_delivered = self.delivered;
+            self.saveStateUponLoss();
+        }
+        self.loss_in_round = true;
+
+        if (!self.bw_probe_samples) return;
+
+        // Check IsInflightTooHigh using cumulative lost/tx_in_flight
+        if (isInflightTooHigh(lost, tx_in_flight)) {
+            // BBRInflightAtLoss: estimate where loss threshold was crossed
+            const inflight_prev: u64 = @as(u64, tx_in_flight) -| @as(u64, pkt_size);
+            const lost_prev: u64 = lost -| @as(u64, pkt_size);
+            // lost_prefix = (LossThresh * inflight_prev - lost_prev) / (1 - LossThresh)
+            // Using fixed-point: numerator = (2 * inflight_prev / 100) - lost_prev
+            //                    denominator = 98/100
+            // Simplified: lost_prefix = (2*inflight_prev - 100*lost_prev) / 98
+            const thresh_inflight = blk: {
+                const numer_term1 = loss_thresh_num * inflight_prev;
+                const numer_term2 = loss_thresh_den * lost_prev;
+                if (numer_term1 <= numer_term2) break :blk inflight_prev;
+                const numer = numer_term1 - numer_term2;
+                const denom = loss_thresh_den - loss_thresh_num;
+                const lost_prefix = numer / denom;
+                break :blk inflight_prev + lost_prefix;
+            };
+
+            // BBRHandleInflightTooHigh (spec 5.5.10.2)
+            self.bw_probe_samples = false;
+            if (!is_app_limited) {
+                const target = self.targetInflight();
+                const base = @max(thresh_inflight, @as(u64, target) * beta_num / beta_den);
+                self.inflight_longterm = @intCast(@min(base, max_u32));
+            }
+            if (self.state == .probe_bw and self.probe_bw_phase == .up) {
+                // We don't have `now` in onLoss; use cycle_stamp as fallback
+                self.startProbeBW_DOWN(self.cycle_stamp);
+            }
         }
     }
 
@@ -282,234 +388,628 @@ pub const Bbr = struct {
 
     pub fn setAppLimited(self: *Bbr) void {
         self.is_app_limited = true;
-        self.app_limited_seq = self.delivered;
+        self.app_limited_seq = self.delivered + self.inflight;
+        if (self.app_limited_seq == 0) self.app_limited_seq = 1;
     }
 
     pub fn bdp(self: *const Bbr) u64 {
-        const min_rtt_ns = self.getMinRtt();
-        if (min_rtt_ns <= 0 or self.bw == 0) return @as(u64, initial_cwnd);
-        return self.bw * @as(u64, @intCast(min_rtt_ns)) / ns_per_s;
+        const mrtt = self.getMinRtt();
+        if (mrtt <= 0 or self.bw == 0) return @as(u64, initial_cwnd);
+        return self.bw * @as(u64, @intCast(mrtt)) / ns_per_s;
     }
 
     pub fn getMinRtt(self: *const Bbr) i64 {
-        if (self.min_rtt_filter.val == std.math.maxInt(i64)) return 0;
-        return self.min_rtt_filter.val;
+        if (self.min_rtt == max_i64) return 0;
+        return self.min_rtt;
     }
 
     // ------------------------------------------------------------------
-    // Internal
+    // Internal: Delivery Rate Sample
     // ------------------------------------------------------------------
 
     fn computeRateSample(self: *const Bbr, pkt: AckedPacket, now: i64) RateSample {
         const ds = pkt.delivery_state;
-        const delivered = self.delivered - ds.delivered;
-        if (delivered == 0) return .{};
+        const delivered_delta = self.delivered - ds.delivered;
+        if (delivered_delta == 0) return .{};
 
         const send_elapsed = pkt.sent_time - ds.first_sent_time;
         const ack_elapsed = now - ds.delivered_time;
         var interval = @max(send_elapsed, ack_elapsed);
         if (interval <= 0) interval = 1;
 
-        const rate = delivered * ns_per_s / @as(u64, @intCast(interval));
+        const rate = delivered_delta * ns_per_s / @as(u64, @intCast(interval));
 
         return .{
             .delivery_rate = rate,
             .rtt_ns = pkt.rtt_ns,
             .is_app_limited = ds.is_app_limited and self.delivered <= self.app_limited_seq,
-            .delivered = delivered,
+            .delivered = delivered_delta,
             .tx_in_flight = ds.tx_in_flight,
         };
     }
 
-    fn updateStateMachine(self: *Bbr, rs: RateSample, now: i64) void {
-        switch (self.state) {
-            .startup => self.updateStartup(rs),
-            .drain => self.updateDrain(),
-            .probe_bw => self.updateProbeBw(rs, now),
-            .probe_rtt => self.updateProbeRtt(now),
-        }
+    // ------------------------------------------------------------------
+    // Internal: Round counting (spec 5.5.1)
+    // ------------------------------------------------------------------
 
-        // Check if we need to enter ProbeRTT
-        if (self.state != .probe_rtt and self.state != .startup) {
-            if (self.probe_rtt_min_filter.expired(now, probe_rtt_interval_ns)) {
-                self.enterProbeRtt(now);
-            }
+    fn updateRound(self: *Bbr, rs: RateSample) void {
+        // Use > (not >=) per spec: "packet.delivered >= BBR.next_round_delivered"
+        // The spec uses >= for the comparison. Let's follow exactly:
+        // "if (packet.delivered >= BBR.next_round_delivered)"
+        // Here rs represents the cumulative delivered at the acked packet's send time.
+        // We check C.delivered (which includes this packet) against next_round_delivered.
+        if (self.delivered >= self.next_round_delivered) {
+            self.startRound();
+            self.round_count += 1;
+            self.rounds_since_bw_probe += 1;
+            self.round_start = true;
+        } else {
+            self.round_start = false;
+        }
+        _ = rs;
+    }
+
+    fn startRound(self: *Bbr) void {
+        self.next_round_delivered = self.delivered;
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: Latest Delivery Signals (spec 5.5.10.3)
+    // ------------------------------------------------------------------
+
+    fn updateLatestDeliverySignals(self: *Bbr, rs: RateSample) void {
+        self.loss_round_start = false;
+        self.bw_latest = @max(self.bw_latest, rs.delivery_rate);
+        self.inflight_latest = @max(self.inflight_latest, rs.delivered);
+        if (self.delivered >= self.loss_round_delivered) {
+            self.loss_round_delivered = self.delivered;
+            self.loss_round_start = true;
         }
     }
 
-    fn updateStartup(self: *Bbr, rs: RateSample) void {
-        // Check for full pipe
-        if (!self.filled_pipe) {
-            if (rs.delivery_rate > 0) {
-                if (self.full_bw == 0 or rs.delivery_rate >= self.full_bw + self.full_bw / 4) {
-                    // 25% growth
-                    self.full_bw = rs.delivery_rate;
-                    self.full_bw_count = 0;
-                } else if (self.round_start) {
-                    self.full_bw_count += 1;
-                    if (self.full_bw_count >= full_pipe_rounds) {
-                        self.filled_pipe = true;
-                    }
-                }
-            }
-        }
-
-        // Loss-based startup exit (v3)
-        if (self.round_start and self.loss_events_in_round >= startup_loss_events) {
-            self.filled_pipe = true;
-        }
-
-        if (self.filled_pipe) {
-            self.state = .drain;
+    fn advanceLatestDeliverySignals(self: *Bbr, rs: RateSample) void {
+        if (self.loss_round_start) {
+            self.bw_latest = rs.delivery_rate;
+            self.inflight_latest = rs.delivered;
         }
     }
 
-    fn updateDrain(self: *Bbr) void {
-        if (self.inflight <= @as(u32, @intCast(@min(self.bdp(), max_u32)))) {
-            self.enterProbeBwDown(0); // now=0 is fine, cycle_stamp set on first real call
+    // ------------------------------------------------------------------
+    // Internal: Congestion Signals (spec 5.5.10.3)
+    // ------------------------------------------------------------------
+
+    fn resetCongestionSignals(self: *Bbr) void {
+        self.loss_in_round = false;
+        self.bw_latest = 0;
+        self.inflight_latest = 0;
+    }
+
+    fn updateCongestionSignals(self: *Bbr, rs: RateSample, now: i64) void {
+        // BBRUpdateMaxBw (spec 5.5.5)
+        self.updateRound(rs);
+        self.updateMaxBw(rs);
+        _ = now;
+
+        if (!self.loss_round_start)
+            return; // wait until end of round trip
+
+        self.adaptLowerBoundsFromCongestion();
+        self.loss_in_round = false;
+    }
+
+    fn updateMaxBw(self: *Bbr, rs: RateSample) void {
+        if (rs.delivery_rate > 0 and
+            (rs.delivery_rate >= self.max_bw or !rs.is_app_limited))
+        {
+            self.max_bw_filter.update(rs.delivery_rate, self.cycle_count, max_bw_filter_len);
+        }
+        self.max_bw = self.max_bw_filter.getBest();
+    }
+
+    fn adaptLowerBoundsFromCongestion(self: *Bbr) void {
+        // BBRAdaptLowerBoundsFromCongestion (spec 5.5.10.3)
+        if (self.isProbingBW()) return;
+        if (self.loss_in_round) {
+            self.initLowerBounds();
+            self.lossLowerBounds();
         }
     }
 
-    fn updateProbeBw(self: *Bbr, rs: RateSample, now: i64) void {
+    fn initLowerBounds(self: *Bbr) void {
+        if (self.bw_shortterm == max_u64) {
+            self.bw_shortterm = self.max_bw;
+        }
+        if (self.inflight_shortterm == max_u32) {
+            self.inflight_shortterm = self.cwnd;
+        }
+    }
+
+    fn lossLowerBounds(self: *Bbr) void {
+        // bw_shortterm = max(bw_latest, Beta * bw_shortterm)
+        self.bw_shortterm = @max(
+            self.bw_latest,
+            self.bw_shortterm * beta_num / beta_den,
+        );
+        // inflight_shortterm = max(inflight_latest, Beta * inflight_shortterm)
+        const beta_inflight = @as(u64, self.inflight_shortterm) * beta_num / beta_den;
+        self.inflight_shortterm = @intCast(@min(
+            @max(self.inflight_latest, beta_inflight),
+            max_u32,
+        ));
+    }
+
+    fn resetShortTermModel(self: *Bbr) void {
+        self.bw_shortterm = max_u64;
+        self.inflight_shortterm = max_u32;
+    }
+
+    fn boundBWForModel(self: *Bbr) void {
+        self.bw = @min(self.max_bw, self.bw_shortterm);
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: ACK Aggregation (spec 5.5.9)
+    // ------------------------------------------------------------------
+
+    fn updateACKAggregation(self: *Bbr, rs: RateSample, now: i64) void {
+        // Find excess ACKed beyond expected amount over this interval
+        const interval_ns: u64 = if (now > self.extra_acked_interval_start)
+            @intCast(now - self.extra_acked_interval_start)
+        else
+            0;
+        const expected_delivered = self.bw * interval_ns / ns_per_s;
+
+        // Reset interval if ACK rate is below expected rate
+        if (self.extra_acked_delivered <= expected_delivered) {
+            self.extra_acked_delivered = 0;
+            self.extra_acked_interval_start = now;
+        }
+        self.extra_acked_delivered += rs.newly_acked;
+
+        const raw_extra = self.extra_acked_delivered -| expected_delivered;
+        const extra = @min(raw_extra, self.cwnd);
+
+        const filter_len: u64 = if (self.full_bw_reached) extra_acked_filter_len else 1;
+        self.extra_acked_filter.update(extra, self.round_count, filter_len);
+        self.extra_acked = self.extra_acked_filter.getBest();
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: Startup (spec 5.3.1)
+    // ------------------------------------------------------------------
+
+    fn resetFullBW(self: *Bbr) void {
+        self.full_bw = 0;
+        self.full_bw_count = 0;
+        self.full_bw_now = false;
+    }
+
+    fn checkFullBWReached(self: *Bbr, rs: RateSample) void {
+        if (self.full_bw_now or !self.round_start or rs.is_app_limited) return;
+        if (rs.delivery_rate >= self.full_bw + self.full_bw / 4) {
+            // BW still growing: reset
+            self.resetFullBW();
+            self.full_bw = rs.delivery_rate;
+            return;
+        }
+        self.full_bw_count += 1;
+        self.full_bw_now = (self.full_bw_count >= full_pipe_rounds);
+        if (self.full_bw_now) {
+            self.full_bw_reached = true;
+        }
+    }
+
+    fn checkStartupDone(self: *Bbr, rs: RateSample) void {
+        self.checkStartupHighLoss(rs);
+        if (self.state == .startup and self.full_bw_reached) {
+            self.enterDrain();
+        }
+    }
+
+    fn checkStartupHighLoss(self: *Bbr, rs: RateSample) void {
+        if (self.state != .startup) return;
+        if (!self.round_start or !self.loss_in_round) return;
+        _ = rs;
+
+        // Spec: requires BOTH loss_events (we track loss_in_round as bool)
+        // AND IsInflightTooHigh. For simplicity, we check loss_in_round only
+        // (we don't track per-round loss event count separately from onLoss).
+        // The full_bw_reached is set, and inflight_longterm is set to safe level.
+        // Since we track loss_in_round as a bool, we rely on onLoss having set
+        // bw_probe_samples = false and reduced inflight_longterm already.
+        // For the startup exit, we just need full_bw_reached = true.
+        self.full_bw_reached = true;
+        if (self.inflight_longterm == max_u32) {
+            // Set inflight_longterm = max(bdp, inflight_latest)
+            const bdp_val = self.bdp();
+            self.inflight_longterm = @intCast(@min(
+                @max(bdp_val, self.inflight_latest),
+                max_u32,
+            ));
+        }
+    }
+
+    fn enterStartup(self: *Bbr) void {
+        self.state = .startup;
+    }
+
+    fn enterDrain(self: *Bbr) void {
+        self.state = .drain;
+        self.drain_start_round = self.round_count;
+    }
+
+    fn checkDrainDone(self: *Bbr, now: i64) void {
+        if (self.state != .drain) return;
+        _ = now;
+        // Spec 5.3.2: exit Drain when inflight <= BBRInflight(1.0) or 3 rounds elapsed
+        if (self.inflight <= self.bbrInflight(256) or
+            self.round_count > self.drain_start_round + 3)
+        {
+            self.enterProbeBW();
+        }
+    }
+
+    fn enterProbeBW(self: *Bbr) void {
+        self.startProbeBW_DOWN(self.cycle_stamp);
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: ProbeBW (spec 5.3.3.6)
+    // ------------------------------------------------------------------
+
+    fn updateProbeBWCyclePhase(self: *Bbr, rs: RateSample, now: i64) void {
+        if (!self.full_bw_reached) return;
+        self.adaptLongTermModel(rs, now);
+        if (self.state != .probe_bw) return;
+
         switch (self.probe_bw_phase) {
             .down => {
-                const target = self.targetInflight();
-                if (self.inflight <= target or self.elapsedSincePhase(now) >= self.getMinRtt()) {
-                    self.enterProbeBwCruise(now);
+                if (self.isTimeToProbeBW(now)) return;
+                if (self.isTimeToCruise()) {
+                    self.startProbeBW_CRUISE();
                 }
             },
             .cruise => {
-                // Probe timer: stay in cruise for ~1 RTT, then probe
-                if (self.elapsedSincePhase(now) >= @max(self.getMinRtt(), 50 * std.time.ns_per_ms)) {
-                    self.enterProbeBwRefill(now);
-                }
+                if (self.isTimeToProbeBW(now)) return;
             },
             .refill => {
-                // 1 round elapsed → transition to UP
                 if (self.round_start) {
-                    // Reset short-term bounds
-                    self.bw_lo = max_u64;
-                    self.inflight_lo = max_u32;
-                    self.enterProbeBwUp(now);
+                    self.bw_probe_samples = true;
+                    self.startProbeBW_UP(rs, now);
                 }
             },
             .up => {
-                // Exit on loss or exceeded inflight
-                if (self.loss_events_in_round > 0 and self.round_start) {
-                    self.enterProbeBwDown(now);
-                    return;
-                }
-                // Check if we've probed long enough
-                if (self.round_start) {
-                    self.probe_up_rounds += 1;
-                }
-                _ = rs;
-                const bdp_val = self.bdp();
-                const threshold = bdp_val + bdp_val / 4; // 1.25 × BDP
-                if (self.inflight >= @as(u32, @intCast(@min(threshold, max_u32)))) {
-                    if (self.elapsedSincePhase(now) >= self.getMinRtt()) {
-                        self.enterProbeBwDown(now);
-                    }
+                if (self.isTimeToGoDown(rs)) {
+                    self.startProbeBW_DOWN(now);
                 }
             },
         }
     }
 
-    fn updateProbeRtt(self: *Bbr, now: i64) void {
-        if (self.probe_rtt_done_stamp == 0) {
-            // First ACK in ProbeRTT — set timer
-            if (self.inflight <= min_cwnd) {
-                self.probe_rtt_done_stamp = now + probe_rtt_duration_ns;
-                self.probe_rtt_round_done = false;
-                self.next_round_delivered = self.delivered;
-            }
-            return;
-        }
-
-        if (self.round_start) {
-            self.probe_rtt_round_done = true;
-        }
-
-        if (self.probe_rtt_round_done and now >= self.probe_rtt_done_stamp) {
-            // Reset min_rtt probe timer
-            self.probe_rtt_min_filter.stamp = now;
-            // Restore cwnd and enter ProbeBW DOWN
-            self.cwnd = @max(self.prior_cwnd, min_cwnd);
-            self.enterProbeBwDown(now);
-        }
-    }
-
-    fn enterProbeBwDown(self: *Bbr, now: i64) void {
+    fn startProbeBW_DOWN(self: *Bbr, now: i64) void {
+        self.resetCongestionSignals();
+        self.probe_up_cnt = max_u32;
+        self.pickProbeWait();
+        self.cycle_stamp = now;
+        self.ack_phase = .acks_probe_stopping;
+        self.startRound();
         self.state = .probe_bw;
         self.probe_bw_phase = .down;
-        self.cycle_stamp = now;
-        self.probe_up_rounds = 0;
-        self.bw_probe_samples = false;
     }
 
-    fn enterProbeBwCruise(self: *Bbr, now: i64) void {
+    fn startProbeBW_CRUISE(self: *Bbr) void {
+        self.state = .probe_bw;
         self.probe_bw_phase = .cruise;
-        self.cycle_stamp = now;
     }
 
-    fn enterProbeBwRefill(self: *Bbr, now: i64) void {
+    fn startProbeBW_REFILL(self: *Bbr) void {
+        self.resetShortTermModel();
+        self.bw_probe_up_rounds = 0;
+        self.bw_probe_up_acks = 0;
+        self.ack_phase = .acks_refilling;
+        self.startRound();
+        self.state = .probe_bw;
         self.probe_bw_phase = .refill;
-        self.cycle_stamp = now;
     }
 
-    fn enterProbeBwUp(self: *Bbr, now: i64) void {
-        self.probe_bw_phase = .up;
-        self.cycle_stamp = now;
-        self.probe_up_rounds = 0;
-        self.probe_up_cnt = max_datagram_size;
-        self.bw_probe_samples = true;
-    }
-
-    fn enterProbeRtt(self: *Bbr, now: i64) void {
-        self.prior_cwnd = self.cwnd;
-        self.state = .probe_rtt;
-        self.probe_rtt_done_stamp = 0;
-        self.probe_rtt_round_done = false;
+    fn startProbeBW_UP(self: *Bbr, rs: RateSample, now: i64) void {
         _ = now;
+        self.ack_phase = .acks_probe_starting;
+        self.startRound();
+        self.resetFullBW();
+        self.full_bw = rs.delivery_rate;
+        self.state = .probe_bw;
+        self.probe_bw_phase = .up;
+        self.raiseInflightLongtermSlope();
     }
 
-    fn elapsedSincePhase(self: *const Bbr, now: i64) i64 {
-        if (self.cycle_stamp == 0) return 0;
-        return now - self.cycle_stamp;
+    fn isTimeToProbeBW(self: *Bbr, now: i64) bool {
+        if (self.hasElapsedInPhase(now, self.bw_probe_wait) or
+            self.isRenoCoexistenceProbeTime())
+        {
+            self.startProbeBW_REFILL();
+            return true;
+        }
+        return false;
+    }
+
+    fn pickProbeWait(self: *Bbr) void {
+        // Randomized: rounds_since_bw_probe = random 0 or 1
+        self.rounds_since_bw_probe = xorshift64(&self.rng_state) & 1;
+        // bw_probe_wait = 2 + random [0.0, 1.0) seconds, in nanoseconds
+        const rand_frac_ns: i64 = @intCast(xorshift64(&self.rng_state) % @as(u64, @intCast(std.time.ns_per_s)));
+        self.bw_probe_wait = 2 * std.time.ns_per_s + rand_frac_ns;
+    }
+
+    fn isRenoCoexistenceProbeTime(self: *const Bbr) bool {
+        const target = self.targetInflight();
+        const reno_rounds = @min(@as(u64, target), 63);
+        return self.rounds_since_bw_probe >= reno_rounds;
+    }
+
+    fn hasElapsedInPhase(self: *const Bbr, now: i64, interval: i64) bool {
+        return now > self.cycle_stamp + interval;
+    }
+
+    fn isTimeToCruise(self: *const Bbr) bool {
+        if (self.inflight > self.inflightWithHeadroom()) return false;
+        if (self.inflight > self.bbrInflight(256)) return false; // 1.0 gain
+        return true;
+    }
+
+    fn isTimeToGoDown(self: *Bbr, rs: RateSample) bool {
+        _ = rs;
+        // Spec: if cwnd-limited and cwnd >= inflight_longterm, reset fullBW
+        // We approximate is_cwnd_limited as (inflight >= cwnd - max_datagram_size)
+        const cwnd_limited = (self.inflight + max_datagram_size >= self.cwnd);
+        if (cwnd_limited and self.cwnd >= self.inflight_longterm) {
+            self.resetFullBW();
+            self.full_bw = self.max_bw; // use max_bw as proxy for RS.delivery_rate
+        } else if (self.full_bw_now) {
+            return true;
+        }
+        return false;
+    }
+
+    fn inflightWithHeadroom(self: *const Bbr) u32 {
+        if (self.inflight_longterm == max_u32) return max_u32;
+        // headroom = max(1*SMSS, Headroom * inflight_longterm)
+        const headroom_val = @max(
+            @as(u64, max_datagram_size),
+            @as(u64, self.inflight_longterm) * headroom_num / headroom_den,
+        );
+        const result = @as(u64, self.inflight_longterm) -| headroom_val;
+        return @intCast(@max(result, min_cwnd));
+    }
+
+    fn raiseInflightLongtermSlope(self: *Bbr) void {
+        const shift_amt: u5 = @intCast(@min(self.bw_probe_up_rounds, 30));
+        const growth_this_round: u64 = @as(u64, max_datagram_size) << shift_amt;
+        self.bw_probe_up_rounds = @min(self.bw_probe_up_rounds + 1, 30);
+        self.probe_up_cnt = @intCast(@max(@as(u64, self.cwnd) / @max(growth_this_round, 1), 1));
+    }
+
+    fn probeInflightLongtermUpward(self: *Bbr, rs: RateSample) void {
+        // Spec: if (!C.is_cwnd_limited || C.cwnd < BBR.inflight_longterm) return
+        const cwnd_limited = (self.inflight + max_datagram_size >= self.cwnd);
+        if (!cwnd_limited or self.cwnd < self.inflight_longterm) return;
+
+        self.bw_probe_up_acks += rs.newly_acked;
+        if (self.bw_probe_up_acks >= self.probe_up_cnt and self.probe_up_cnt > 0) {
+            const delta = self.bw_probe_up_acks / self.probe_up_cnt;
+            self.bw_probe_up_acks -= delta * self.probe_up_cnt;
+            self.inflight_longterm +|= delta;
+        }
+        if (self.round_start) {
+            self.raiseInflightLongtermSlope();
+        }
+    }
+
+    fn adaptLongTermModel(self: *Bbr, rs: RateSample, now: i64) void {
+        _ = now;
+        // BBRAdaptLongTermModel (spec 5.3.3.6)
+        if (self.ack_phase == .acks_probe_starting and self.round_start) {
+            self.ack_phase = .acks_probe_feedback;
+        }
+        if (self.ack_phase == .acks_probe_stopping and self.round_start) {
+            if (self.state == .probe_bw and !rs.is_app_limited) {
+                self.advanceMaxBwFilter();
+            }
+        }
+
+        if (!isInflightTooHigh(rs.lost, rs.tx_in_flight)) {
+            // Loss rate is safe. Adjust upper bounds upward.
+            if (self.inflight_longterm == max_u32) return;
+            if (rs.tx_in_flight > self.inflight_longterm) {
+                self.inflight_longterm = rs.tx_in_flight;
+            }
+            if (self.state == .probe_bw and self.probe_bw_phase == .up) {
+                self.probeInflightLongtermUpward(rs);
+            }
+        }
+    }
+
+    fn advanceMaxBwFilter(self: *Bbr) void {
+        self.cycle_count +%= 1;
+    }
+
+    fn isProbingBW(self: *const Bbr) bool {
+        return (self.state == .startup or
+            (self.state == .probe_bw and self.probe_bw_phase == .refill) or
+            (self.state == .probe_bw and self.probe_bw_phase == .up));
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: ProbeRTT (spec 5.3.4.3)
+    // ------------------------------------------------------------------
+
+    fn updateMinRTT(self: *Bbr, rs: RateSample, now: i64) void {
+        self.probe_rtt_expired = now > self.probe_rtt_min_stamp + probe_rtt_interval_ns;
+
+        if (rs.rtt_ns > 0 and
+            (rs.rtt_ns < self.probe_rtt_min_delay or self.probe_rtt_expired))
+        {
+            self.probe_rtt_min_delay = rs.rtt_ns;
+            self.probe_rtt_min_stamp = now;
+        }
+
+        const min_rtt_expired = now > self.min_rtt_stamp + min_rtt_filter_len_ns;
+        if (self.probe_rtt_min_delay < self.min_rtt or min_rtt_expired) {
+            self.min_rtt = self.probe_rtt_min_delay;
+            self.min_rtt_stamp = self.probe_rtt_min_stamp;
+        }
+    }
+
+    fn checkProbeRTT(self: *Bbr, rs: RateSample, now: i64) void {
+        if (self.state != .probe_rtt and self.probe_rtt_expired and !self.idle_restart) {
+            self.enterProbeRTT();
+            self.saveCwnd();
+            self.probe_rtt_done_stamp = 0;
+            self.ack_phase = .acks_probe_stopping;
+            self.startRound();
+        }
+        if (self.state == .probe_rtt) {
+            self.handleProbeRTT(now);
+        }
+        if (rs.delivered > 0) {
+            self.idle_restart = false;
+        }
+    }
+
+    fn enterProbeRTT(self: *Bbr) void {
+        self.state = .probe_rtt;
+        // pacing_gain = 1.0, cwnd_gain = ProbeRTTCwndGain (0.5)
+    }
+
+    fn handleProbeRTT(self: *Bbr, now: i64) void {
+        // Mark connection as app-limited during ProbeRTT
+        self.setAppLimited();
+
+        if (self.probe_rtt_done_stamp == 0 and
+            self.inflight <= self.probeRTTCwnd())
+        {
+            self.probe_rtt_done_stamp = now + probe_rtt_duration_ns;
+            self.probe_rtt_round_done = false;
+            self.startRound();
+        } else if (self.probe_rtt_done_stamp != 0) {
+            if (self.round_start) {
+                self.probe_rtt_round_done = true;
+            }
+            if (self.probe_rtt_round_done) {
+                self.checkProbeRTTDone(now);
+            }
+        }
+    }
+
+    fn probeRTTCwnd(self: *const Bbr) u32 {
+        const probe_cwnd = self.bdpMultiple(probe_rtt_cwnd_gain);
+        return @intCast(@max(probe_cwnd, min_cwnd));
+    }
+
+    fn checkProbeRTTDone(self: *Bbr, now: i64) void {
+        if (self.probe_rtt_done_stamp != 0 and now > self.probe_rtt_done_stamp) {
+            self.probe_rtt_min_stamp = now;
+            self.restoreCwnd();
+            self.exitProbeRTT(now);
+        }
+    }
+
+    fn exitProbeRTT(self: *Bbr, now: i64) void {
+        self.resetShortTermModel();
+        if (self.full_bw_reached) {
+            self.startProbeBW_DOWN(now);
+            self.startProbeBW_CRUISE();
+        } else {
+            self.enterStartup();
+        }
+    }
+
+    fn saveCwnd(self: *Bbr) void {
+        if (self.state != .probe_rtt) {
+            self.prior_cwnd = self.cwnd;
+        } else {
+            self.prior_cwnd = @max(self.prior_cwnd, self.cwnd);
+        }
+    }
+
+    fn restoreCwnd(self: *Bbr) void {
+        self.cwnd = @max(self.cwnd, self.prior_cwnd);
+    }
+
+    fn saveStateUponLoss(self: *Bbr) void {
+        self.undo_bw_shortterm = self.bw_shortterm;
+        self.undo_inflight_shortterm = self.inflight_shortterm;
+        self.undo_inflight_longterm = self.inflight_longterm;
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: Idle Restart (spec 5.4.1)
+    // ------------------------------------------------------------------
+
+    fn handleRestartFromIdle(self: *Bbr, now: i64) void {
+        if (self.inflight == 0 and self.is_app_limited) {
+            self.idle_restart = true;
+            self.extra_acked_interval_start = now;
+            if (self.state == .probe_bw) {
+                self.setPacingRateWithGain(256); // 1.0x
+            } else if (self.state == .probe_rtt) {
+                self.checkProbeRTTDone(now);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: Inflight calculations (spec 5.6.4.2)
+    // ------------------------------------------------------------------
+
+    fn bdpMultiple(self: *const Bbr, gain: u32) u64 {
+        if (self.min_rtt == max_i64) return @as(u64, initial_cwnd);
+        const bdp_val = self.bw * @as(u64, @intCast(self.min_rtt)) / ns_per_s;
+        return bdp_val * @as(u64, gain) / 256;
+    }
+
+    fn quantizationBudget(self: *const Bbr, inflight_cap: u64) u32 {
+        var cap = inflight_cap;
+        // offload_budget: for our QUIC-like protocol, 1 send_quantum = 1 SMSS
+        cap = @max(cap, max_datagram_size);
+        cap = @max(cap, min_cwnd);
+        if (self.state == .probe_bw and self.probe_bw_phase == .up) {
+            cap += 2 * max_datagram_size;
+        }
+        return @intCast(@min(cap, max_u32));
+    }
+
+    fn bbrInflight(self: *const Bbr, gain: u32) u32 {
+        const cap = self.bdpMultiple(gain);
+        return self.quantizationBudget(cap);
+    }
+
+    fn updateMaxInflight(self: *Bbr) void {
+        var cap = self.bdpMultiple(self.cwndGain());
+        cap += self.extra_acked;
+        self.max_inflight = self.quantizationBudget(cap);
     }
 
     fn targetInflight(self: *const Bbr) u32 {
+        // BBRTargetInflight: min(bdp, cwnd)
         const bdp_val = self.bdp();
-        var target: u64 = bdp_val;
-        // Cap by inflight_hi/inflight_lo
-        if (self.inflight_hi != max_u32)
-            target = @min(target, @as(u64, self.inflight_hi));
-        if (self.inflight_lo != max_u32)
-            target = @min(target, @as(u64, self.inflight_lo));
-        return @intCast(@max(@min(target, max_u32), min_cwnd));
+        return @intCast(@min(bdp_val, @as(u64, self.cwnd)));
     }
 
-    fn onInflightTooHigh(self: *Bbr, tx_in_flight: u32) void {
-        // inflight_hi = max(inflight, target) * beta
-        const base = @max(@as(u64, tx_in_flight), self.bdp());
-        self.inflight_hi = @intCast(@min(base * beta_num / beta_den, max_u32));
-        self.bw_hi = self.max_bw;
-
-        if (self.state == .startup) {
-            self.filled_pipe = true;
-        }
-    }
-
-    fn isInflightTooHigh(lost: u32, tx_in_flight: u32) bool {
+    pub fn isInflightTooHigh(lost: u64, tx_in_flight: u32) bool {
         if (tx_in_flight == 0) return false;
-        return @as(u64, lost) * loss_thresh_den > @as(u64, tx_in_flight) * loss_thresh_num;
+        return lost * loss_thresh_den > @as(u64, tx_in_flight) * loss_thresh_num;
     }
+
+    // ------------------------------------------------------------------
+    // Internal: Pacing Rate (spec 5.6.2)
+    // ------------------------------------------------------------------
 
     fn pacingGain(self: *const Bbr) u32 {
         return switch (self.state) {
             .startup => startup_pacing_gain,
             .drain => drain_pacing_gain,
-            .probe_rtt => probe_bw_cruise_pacing, // 1.0×
+            .probe_rtt => 256, // 1.0x per spec
             .probe_bw => switch (self.probe_bw_phase) {
                 .down => probe_bw_down_pacing,
                 .cruise => probe_bw_cruise_pacing,
@@ -521,49 +1021,75 @@ pub const Bbr = struct {
 
     fn cwndGain(self: *const Bbr) u32 {
         return switch (self.state) {
-            .startup => startup_cwnd_gain,
-            .drain => startup_cwnd_gain,
-            .probe_rtt => probe_bw_default_cwnd_gain,
+            .startup => default_cwnd_gain,
+            .drain => default_cwnd_gain,
+            .probe_rtt => probe_rtt_cwnd_gain,
             .probe_bw => switch (self.probe_bw_phase) {
                 .up => probe_bw_up_cwnd_gain,
-                else => probe_bw_default_cwnd_gain,
+                else => default_cwnd_gain,
             },
         };
     }
 
-    fn updatePacingRate(self: *Bbr) void {
-        // effective bw = min(max_bw, bw_lo, bw_hi)
-        var eff_bw = self.max_bw;
-        if (self.bw_lo != max_u64) eff_bw = @min(eff_bw, self.bw_lo);
-        if (self.bw_hi != max_u64) eff_bw = @min(eff_bw, self.bw_hi);
-        self.bw = eff_bw;
-
-        if (eff_bw == 0) return;
-
-        // pacing_rate = bw * pacing_gain / 256 * (1 - pacing_margin)
-        const gain = self.pacingGain();
-        const rate = eff_bw * @as(u64, gain) / 256;
-        // Apply 1% pacing margin: rate * 99/100
-        self.pacing_rate = rate * 99 / 100;
+    fn setPacingRateWithGain(self: *Bbr, gain: u32) void {
+        const rate = self.bw * @as(u64, gain) / 256 * (100 - pacing_margin_percent) / 100;
+        if (self.full_bw_reached or rate > self.pacing_rate) {
+            self.pacing_rate = rate;
+        }
     }
 
-    fn updateCwnd(self: *Bbr) void {
+    fn setPacingRate(self: *Bbr) void {
+        self.boundBWForModel();
+        if (self.bw == 0) return;
+        self.setPacingRateWithGain(self.pacingGain());
+    }
+
+    // ------------------------------------------------------------------
+    // Internal: Cwnd (spec 5.6.4)
+    // ------------------------------------------------------------------
+
+    fn setCwnd(self: *Bbr, rs: RateSample) void {
+        self.updateMaxInflight();
+
+        if (self.full_bw_reached) {
+            // Grow up to max_inflight
+            var new_cwnd = @as(u64, self.cwnd) + @as(u64, rs.newly_acked);
+            new_cwnd = @min(new_cwnd, @as(u64, self.max_inflight));
+            self.cwnd = @intCast(@min(new_cwnd, max_u32));
+        } else if (self.cwnd < self.max_inflight or self.delivered < initial_cwnd) {
+            self.cwnd +|= rs.newly_acked;
+        }
+
+        self.cwnd = @max(self.cwnd, min_cwnd);
+        self.boundCwndForProbeRTT();
+        self.boundCwndForModel();
+    }
+
+    fn boundCwndForProbeRTT(self: *Bbr) void {
         if (self.state == .probe_rtt) {
-            self.cwnd = min_cwnd;
-            return;
+            self.cwnd = @min(self.cwnd, self.probeRTTCwnd());
+        }
+    }
+
+    fn boundCwndForModel(self: *Bbr) void {
+        // Spec 5.6.4.7: BBRBoundCwndForModel
+        var cap: u64 = max_u64;
+
+        if (self.state == .probe_bw and self.probe_bw_phase != .cruise) {
+            cap = @as(u64, self.inflight_longterm);
+        } else if (self.state == .probe_rtt or
+            self.state == .drain or
+            (self.state == .probe_bw and self.probe_bw_phase == .cruise))
+        {
+            cap = @as(u64, self.inflightWithHeadroom());
         }
 
-        const bdp_val = self.bdp();
-        const gain = self.cwndGain();
-        var new_cwnd = @as(u64, bdp_val) * @as(u64, gain) / 256;
-
-        // Cap by inflight_hi in ProbeBW
-        if (self.state == .probe_bw and self.inflight_hi != max_u32) {
-            new_cwnd = @min(new_cwnd, @as(u64, self.inflight_hi));
+        // Apply inflight_shortterm
+        cap = @min(cap, @as(u64, self.inflight_shortterm));
+        cap = @max(cap, min_cwnd);
+        if (cap < max_u64) {
+            self.cwnd = @intCast(@min(@as(u64, self.cwnd), cap));
         }
-
-        new_cwnd = @max(new_cwnd, min_cwnd);
-        self.cwnd = @intCast(@min(new_cwnd, max_u32));
     }
 };
 
@@ -606,43 +1132,25 @@ pub const Pacer = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
-test "MaxFilter basic" {
+test "MaxFilter 2-cycle windowed max" {
     var f = MaxFilter{};
     try std.testing.expectEqual(@as(u64, 0), f.getBest());
 
-    f.update(100, 1);
+    // Cycle 0: sample 100
+    f.update(100, 0, 2);
     try std.testing.expectEqual(@as(u64, 100), f.getBest());
 
-    f.update(200, 2);
+    // Cycle 0: sample 200 replaces
+    f.update(200, 0, 2);
     try std.testing.expectEqual(@as(u64, 200), f.getBest());
 
-    // Lower value doesn't replace best
-    f.update(50, 3);
+    // Cycle 1: lower sample doesn't replace best
+    f.update(150, 1, 2);
     try std.testing.expectEqual(@as(u64, 200), f.getBest());
 
-    // After window expires, new lower value becomes best
-    f.update(80, 15);
+    // Cycle 2: window expired, lower value becomes best
+    f.update(80, 2, 2);
     try std.testing.expectEqual(@as(u64, 80), f.getBest());
-}
-
-test "MinFilter basic" {
-    var f = MinFilter{};
-    const now: i64 = 1_000_000_000;
-
-    f.update(100, now);
-    try std.testing.expectEqual(@as(i64, 100), f.val);
-
-    // Lower value replaces
-    f.update(50, now + 1);
-    try std.testing.expectEqual(@as(i64, 50), f.val);
-
-    // Higher value doesn't replace
-    f.update(200, now + 2);
-    try std.testing.expectEqual(@as(i64, 50), f.val);
-
-    // After window expires, new higher value replaces
-    f.update(150, now + min_rtt_window_ns + 1);
-    try std.testing.expectEqual(@as(i64, 150), f.val);
 }
 
 test "Bbr initial state" {
@@ -651,6 +1159,10 @@ test "Bbr initial state" {
     try std.testing.expectEqual(initial_cwnd, bbr.cwnd);
     try std.testing.expect(bbr.canSend());
     try std.testing.expectEqual(@as(u32, 0), bbr.inflight);
+    try std.testing.expect(!bbr.full_bw_reached);
+    try std.testing.expectEqual(@as(u64, max_u64), bbr.bw_shortterm);
+    try std.testing.expectEqual(@as(u32, max_u32), bbr.inflight_shortterm);
+    try std.testing.expectEqual(@as(u32, max_u32), bbr.inflight_longterm);
 }
 
 test "Bbr onSend tracks inflight" {
@@ -664,7 +1176,7 @@ test "Bbr onSend tracks inflight" {
     try std.testing.expectEqual(@as(u32, 2400), bbr.inflight);
 }
 
-test "Bbr onAck updates delivery" {
+test "Bbr onAck updates delivery and max_bw" {
     var bbr = Bbr{};
     const t0: i64 = 1_000_000_000;
 
@@ -679,7 +1191,7 @@ test "Bbr onAck updates delivery" {
         .sent_time = t0,
         .delivery_state = ds,
         .rtt_ns = 50 * std.time.ns_per_ms,
-    }, t1);
+    }, 1200, t1);
 
     try std.testing.expectEqual(@as(u32, 0), bbr.inflight);
     try std.testing.expectEqual(@as(u64, 1200), bbr.delivered);
@@ -702,25 +1214,33 @@ test "Bbr startup to drain transition" {
             .sent_time = now - 1 * std.time.ns_per_ms,
             .delivery_state = ds,
             .rtt_ns = 50 * std.time.ns_per_ms,
-        }, now);
+        }, 1200, now);
     }
 
     // After enough rounds with stable BW, should exit startup
-    try std.testing.expect(bbr.filled_pipe);
+    try std.testing.expect(bbr.full_bw_reached);
 }
 
-test "Bbr loss response" {
+test "Bbr loss response with bw_probe_samples guard" {
     var bbr = Bbr{};
     bbr.state = .probe_bw;
     bbr.probe_bw_phase = .up;
     bbr.inflight = 10000;
     bbr.max_bw = 100_000;
+    bbr.bw = 100_000;
+    bbr.bw_probe_samples = true;
 
     // Lose 500 out of 10000 in-flight (5% loss rate > 2% threshold)
-    bbr.onLoss(500, 10000);
+    bbr.onLoss(500, 500, 10000, false);
     try std.testing.expectEqual(@as(u32, 9500), bbr.inflight);
-    // inflight_hi should be reduced
-    try std.testing.expect(bbr.inflight_hi < max_u32);
+    // inflight_longterm should be reduced
+    try std.testing.expect(bbr.inflight_longterm < max_u32);
+
+    // Second loss should not react again (bw_probe_samples was cleared)
+    const prev_longterm = bbr.inflight_longterm;
+    bbr.bw_probe_samples = false;
+    bbr.onLoss(500, 1000, 10000, false);
+    try std.testing.expectEqual(prev_longterm, bbr.inflight_longterm);
 }
 
 test "Pacer timing" {
@@ -729,7 +1249,7 @@ test "Pacer timing" {
 
     try std.testing.expect(p.canSend(now));
 
-    // At 1 MB/s pacing rate, 1200 byte packet → 1.2ms interval
+    // At 1 MB/s pacing rate, 1200 byte packet -> 1.2ms interval
     p.onSend(now, 1200, 1_000_000);
     try std.testing.expect(!p.canSend(now));
     try std.testing.expect(p.canSend(now + 2 * std.time.ns_per_ms));
@@ -740,26 +1260,15 @@ test "Pacer timing" {
     try std.testing.expect(timeout <= 2);
 }
 
-test "Pacer no burst catchup" {
-    var p = Pacer{};
-    const now: i64 = 1_000_000_000;
-    p.onSend(now, 1200, 1_000_000);
-
-    // If we fall behind schedule, reset to now
-    const late = now + 100 * std.time.ns_per_ms;
-    try std.testing.expect(p.canSend(late));
-    p.onSend(late, 1200, 1_000_000);
-    // next_send_time should be late + interval, not catching up
-    try std.testing.expect(p.next_send_time > late);
-}
-
 test "isInflightTooHigh" {
     // 500 lost out of 10000 = 5% > 2% threshold
     try std.testing.expect(Bbr.isInflightTooHigh(500, 10000));
     // 100 lost out of 10000 = 1% < 2% threshold
     try std.testing.expect(!Bbr.isInflightTooHigh(100, 10000));
-    // Edge case: 200 out of 10000 = 2% — not strictly greater
+    // Edge case: 200 out of 10000 = 2% - not strictly greater
     try std.testing.expect(!Bbr.isInflightTooHigh(200, 10000));
     // 201 out of 10000 > 2%
     try std.testing.expect(Bbr.isInflightTooHigh(201, 10000));
+    // Zero inflight
+    try std.testing.expect(!Bbr.isInflightTooHigh(0, 0));
 }

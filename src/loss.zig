@@ -197,6 +197,9 @@ pub const LossDetector = struct {
         }
     }
 
+    /// Detect lost packets and append to retransmit_list.
+    /// Returns the earliest time a not-yet-lost packet might become lost
+    /// (for setting a loss detection timer), or 0 if no timer needed.
     pub fn detectLosses(
         self: *LossDetector,
         send_buf: *SendBuffer,
@@ -204,10 +207,11 @@ pub const LossDetector = struct {
         srtt_ns: i64,
         latest_rtt_ns: i64,
         retransmit_list: *std.ArrayListUnmanaged(u32),
-    ) void {
-        if (!self.has_largest_acked) return;
+    ) i64 {
+        if (!self.has_largest_acked) return 0;
 
         const loss_delay = @divFloor(time_threshold_num * @max(srtt_ns, latest_rtt_ns), time_threshold_den);
+        var earliest_loss_time: i64 = 0;
 
         var seq = send_buf.head_seq;
         while (seq != send_buf.tail_seq) : (seq +%= 1) {
@@ -217,15 +221,35 @@ pub const LossDetector = struct {
 
             // Packet threshold: lost if 3 later packets ACKed
             if (self.largest_acked -% seq >= packet_threshold) {
-                retransmit_list.appendBounded(seq) catch return;
+                // Skip if already queued for retransmit
+                if (!isInQueue(retransmit_list, seq)) {
+                    retransmit_list.appendBounded(seq) catch continue;
+                }
                 continue;
             }
 
             // Time threshold
             if (now - entry.sent_time >= loss_delay) {
-                retransmit_list.appendBounded(seq) catch return;
+                if (!isInQueue(retransmit_list, seq)) {
+                    retransmit_list.appendBounded(seq) catch continue;
+                }
+            } else {
+                // Track earliest time this packet would become lost
+                const loss_time = entry.sent_time + loss_delay;
+                if (earliest_loss_time == 0 or loss_time < earliest_loss_time) {
+                    earliest_loss_time = loss_time;
+                }
             }
         }
+
+        return earliest_loss_time;
+    }
+
+    fn isInQueue(list: *const std.ArrayListUnmanaged(u32), seq: u32) bool {
+        for (list.items) |s| {
+            if (s == seq) return true;
+        }
+        return false;
     }
 };
 
