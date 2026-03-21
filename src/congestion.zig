@@ -1102,7 +1102,7 @@ pub const Bbr = struct {
 
     fn probeRTTCwnd(self: *const Bbr) u32 {
         const probe_cwnd = self.bdpMultiple(probe_rtt_cwnd_gain);
-        return @intCast(@max(probe_cwnd, min_cwnd));
+        return @intCast(@min(@max(probe_cwnd, min_cwnd), max_u32));
     }
 
     fn checkProbeRTTDone(self: *Bbr, now: i64) void {
