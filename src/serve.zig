@@ -484,6 +484,13 @@ pub const Gateway = struct {
         if (self.pending_output.items.len == 0 and self.retransmit_queue.items.len == 0) {
             self.bbr.setAppLimited();
         }
+
+        // Arm PTO timer after sending new data (RFC 9002 §6.2.1).
+        // Without this, packets sent after all prior packets were acked
+        // would never trigger PTO if the ACK is lost.
+        if (self.send_buf.oldestUnackedSentTime() != null and self.pto_time == 0 and self.loss_time == 0) {
+            self.setLossDetectionTimer(now);
+        }
     }
 
     fn processOutputAcks(self: *Gateway, payload: []const u8, now: i64) void {
