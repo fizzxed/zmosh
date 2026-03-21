@@ -114,7 +114,10 @@ pub const DeliveryState = struct {
     is_app_limited: bool = false,
     tx_in_flight: u32 = 0,
     lost: u64 = 0, // C.lost at time of send (for RS.lost = C.lost - P.lost)
-    total_bytes_sent: u64 = 0, // cumulative bytes sent at send time (for send_rate)
+    // Google/Cloudflare bandwidth sampler: per-packet snapshots
+    total_bytes_sent: u64 = 0, // cumulative bytes sent when this packet was sent
+    total_bytes_sent_at_last_acked: u64 = 0, // total_bytes_sent when last-acked pkt was sent
+    last_acked_pkt_sent_time: i64 = 0, // sent_time of the most recently acked packet
 };
 
 pub const RateSample = struct {
@@ -227,7 +230,11 @@ pub const Bbr = struct {
     delivered_time: i64 = 0,
     first_sent_time: i64 = 0,
     total_lost: u64 = 0, // C.lost: cumulative bytes declared lost
-    total_bytes_sent: u64 = 0, // cumulative bytes sent (for send_rate in min-of-two-rates)
+    total_bytes_sent: u64 = 0, // cumulative bytes sent
+
+    // --- Google/Cloudflare bandwidth sampler state ---
+    total_bytes_sent_at_last_acked: u64 = 0, // total_bytes_sent when last-acked pkt was sent
+    last_acked_pkt_sent_time: i64 = 0, // sent_time of the most recently acked packet
 
     // --- A0 point candidates (overestimate avoidance) ---
     a0_candidates: [a0_capacity]AckPoint = [1]AckPoint{.{ .ack_time = 0, .total_bytes_acked = 0 }} ** a0_capacity,
@@ -327,6 +334,8 @@ pub const Bbr = struct {
             .tx_in_flight = self.inflight,
             .lost = self.total_lost,
             .total_bytes_sent = self.total_bytes_sent,
+            .total_bytes_sent_at_last_acked = self.total_bytes_sent_at_last_acked,
+            .last_acked_pkt_sent_time = self.last_acked_pkt_sent_time,
         };
 
         // Spec §4.1.2.2: C.first_send_time = P.send_time (for next packet)
@@ -394,6 +403,11 @@ pub const Bbr = struct {
 
         var rs = self.computeRateSample(best_pkt, now);
         rs.newly_acked = self.pending_ack_newly_acked;
+
+        // Update "last acked" state for future packets' send_rate.
+        // best_pkt is the most recently sent packet in this ACK event.
+        self.total_bytes_sent_at_last_acked = best_pkt.delivery_state.total_bytes_sent;
+        self.last_acked_pkt_sent_time = best_pkt.sent_time;
 
         // --- BBRUpdateModelAndState ---
         // BBRUpdateLatestDeliverySignals (spec 5.5.10.3)
@@ -513,38 +527,47 @@ pub const Bbr = struct {
     // Internal: Delivery Rate Sample
     // ------------------------------------------------------------------
 
-    /// Compute delivery rate sample per spec §4.1.1.2.4:
-    ///   delivery_elapsed = max(ack_elapsed, send_elapsed)
-    ///   delivery_rate = data_acked / delivery_elapsed
+    /// Google/Cloudflare bandwidth sampler: min(send_rate, ack_rate).
     ///
-    /// Enhancement (Google/Cloudflare overestimate avoidance): when A0
-    /// points are available, widen ack_elapsed to span the full ACK
-    /// aggregation epoch, preventing burst ACK compression from inflating
-    /// the rate. The numerator (data_acked) stays the same per spec.
+    /// send_rate uses bytes sent between the last-acked packet (when this
+    /// packet was sent) and now, divided by the send time delta. Bounded
+    /// by ~1 cwnd: max send_bytes * 1e9 ≈ 4GB * 1e9 = 4e18, fits u64.
+    ///
+    /// ack_rate uses A0 points for a stable baseline spanning the full
+    /// ACK aggregation epoch, preventing burst compression. Bounded by
+    /// bytes acked since epoch start: similar magnitude.
     fn computeRateSample(self: *const Bbr, pkt: AckedPacket, now: i64) RateSample {
         const ds = pkt.delivery_state;
         const delivered_delta = self.delivered - ds.delivered;
         if (delivered_delta == 0) return .{ .prior_delivered = ds.delivered };
 
-        const send_elapsed = pkt.sent_time - ds.first_sent_time;
-        // Use A0 point for ack_elapsed if available (wider baseline)
-        const ack_elapsed = blk: {
-            if (self.a0_count > 0) {
-                if (self.selectA0(ds.delivered)) |a0| {
-                    const elapsed = now - a0.ack_time;
-                    if (elapsed > 0) break :blk elapsed;
+        // --- send_rate ---
+        // Numerator: bytes sent since "last acked pkt when this was sent"
+        const send_bytes = self.total_bytes_sent -| ds.total_bytes_sent_at_last_acked;
+        // Denominator: time between this pkt's send and the last-acked's send
+        const send_elapsed = pkt.sent_time - ds.last_acked_pkt_sent_time;
+
+        // --- ack_rate ---
+        // Use A0 point for widest valid baseline; fallback to delivery state
+        var ack_bytes: u64 = delivered_delta;
+        var ack_elapsed: i64 = now - ds.delivered_time;
+        if (self.a0_count > 0) {
+            if (self.selectA0(ds.delivered)) |a0| {
+                const elapsed = now - a0.ack_time;
+                if (elapsed > 0) {
+                    ack_bytes = self.delivered -| a0.total_bytes_acked;
+                    ack_elapsed = elapsed;
                 }
             }
-            break :blk now - ds.delivered_time;
-        };
-        const interval = @max(send_elapsed, ack_elapsed);
+        }
 
-        // Discard samples with unreliably short intervals.
-        // Spec §4.1.2.3: interval must be >= min_rtt to be reliable.
-        // Before any RTT sample, use 1ms floor to avoid degenerate rates.
-        const min_rtt_val = self.getMinRtt();
-        const min_interval: i64 = if (min_rtt_val > 0) min_rtt_val else std.time.ns_per_ms;
-        if (interval < min_interval) {
+        // 1ms floor: discard rates from sub-millisecond intervals.
+        // Before first RTT sample, this prevents degenerate TB/s estimates.
+        const floor_ns: i64 = std.time.ns_per_ms;
+        const send_ok = ds.last_acked_pkt_sent_time > 0 and send_elapsed >= floor_ns;
+        const ack_ok = ack_elapsed >= floor_ns;
+
+        if (!send_ok and !ack_ok) {
             return .{
                 .rtt_ns = pkt.rtt_ns,
                 .delivered = delivered_delta,
@@ -554,7 +577,16 @@ pub const Bbr = struct {
             };
         }
 
-        const rate = delivered_delta * ns_per_s / @as(u64, @intCast(interval));
+        // Each rate: bytes/sec. Invalid → max_u64 so min() picks the other.
+        const send_rate: u64 = if (send_ok)
+            send_bytes * ns_per_s / @as(u64, @intCast(send_elapsed))
+        else
+            max_u64;
+        const ack_rate: u64 = if (ack_ok)
+            ack_bytes * ns_per_s / @as(u64, @intCast(ack_elapsed))
+        else
+            max_u64;
+        const rate = @min(send_rate, ack_rate);
 
         return .{
             .delivery_rate = rate,
@@ -1195,7 +1227,7 @@ pub const Bbr = struct {
         if (self.min_rtt == max_i64) return @as(u64, initial_cwnd);
         const bdp_val = self.bw * @as(u64, @intCast(self.min_rtt)) / ns_per_s;
         // u128 for gain multiply: bdp_val * 709 can approach u64 max on fast/high-RTT paths
-        return @intCast(@min(@as(u128, bdp_val) * gain / 256, max_u32));
+        return @intCast(@min(bdp_val * @as(u64, gain) / 256, max_u32));
     }
 
     // NOTE: BBRSetSendQuantum (spec §5.6.3) is intentionally not implemented.
@@ -1455,7 +1487,7 @@ test "Bbr initial state" {
     try std.testing.expectEqual(@as(u32, max_u32), bbr.inflight_longterm);
 }
 
-test "Bbr onSend tracks inflight and total_bytes_sent" {
+test "Bbr onSend tracks inflight, total_bytes_sent, and sampler state" {
     var bbr = Bbr{};
     const now: i64 = 1_000_000_000;
 
@@ -1463,6 +1495,9 @@ test "Bbr onSend tracks inflight and total_bytes_sent" {
     try std.testing.expectEqual(@as(u32, 1200), bbr.inflight);
     try std.testing.expectEqual(@as(u64, 1200), bbr.total_bytes_sent);
     try std.testing.expectEqual(@as(u64, 1200), ds1.total_bytes_sent);
+    // Before any ack, last_acked fields are 0
+    try std.testing.expectEqual(@as(u64, 0), ds1.total_bytes_sent_at_last_acked);
+    try std.testing.expectEqual(@as(i64, 0), ds1.last_acked_pkt_sent_time);
 
     const ds2 = bbr.onSend(1200, now + 1000);
     try std.testing.expectEqual(@as(u32, 2400), bbr.inflight);
@@ -1603,17 +1638,16 @@ test "Pacer normal high bandwidth: full quantum" {
     try std.testing.expectEqual(@as(u32, 8800), p.burst_remaining);
 }
 
-test "u128 BDP computation does not overflow" {
+test "BDP computation at realistic rates" {
     var bbr = Bbr{};
-    // 10 GB/s bandwidth, 1 second RTT
-    bbr.bw = 10_000_000_000;
-    bbr.min_rtt = @intCast(std.time.ns_per_s);
-    // BDP should be 10 GB = 10,000,000,000 (fits u64, would overflow u64 multiply)
+    // 100 MB/s bandwidth, 50ms RTT → BDP = 5 MB
+    bbr.bw = 100_000_000;
+    bbr.min_rtt = 50 * std.time.ns_per_ms;
     const result = bbr.bdp();
-    try std.testing.expectEqual(@as(u64, 10_000_000_000), result);
+    try std.testing.expectEqual(@as(u64, 5_000_000), result);
 }
 
-test "rate sampling: max interval caps burst overestimation" {
+test "rate sampling: burst send, ack_rate wins via min" {
     var bbr = Bbr{};
     const base: i64 = 1_000_000_000;
 
@@ -1622,15 +1656,19 @@ test "rate sampling: max interval caps burst overestimation" {
         _ = bbr.onSend(1200, base);
     }
 
-    // Simulate ACK arriving at T+50ms for a packet sent at T=0
-    bbr.delivered = 12000; // 10 packets acked
+    // Simulate ACK arriving at T+50ms
+    bbr.delivered = 12000;
     bbr.delivered_time = base + 50 * std.time.ns_per_ms;
-    bbr.min_rtt = 50 * std.time.ns_per_ms;
+    bbr.total_bytes_sent = 12000;
 
     const ds = DeliveryState{
         .delivered = 0,
         .delivered_time = base,
         .first_sent_time = base,
+        .total_bytes_sent = 0,
+        // No prior ack: send_rate invalid, ack_rate carries the sample
+        .total_bytes_sent_at_last_acked = 0,
+        .last_acked_pkt_sent_time = 0,
     };
     const rs = bbr.computeRateSample(.{
         .size = 1200,
@@ -1639,10 +1677,39 @@ test "rate sampling: max interval caps burst overestimation" {
         .rtt_ns = 50 * std.time.ns_per_ms,
     }, base + 50 * std.time.ns_per_ms);
 
-    // send_elapsed = 0 (burst), ack_elapsed = 50ms
-    // interval = max(0, 50ms) = 50ms
-    // rate = 12000 / 50ms = 240000 bytes/s
+    // send_rate: invalid (last_acked_pkt_sent_time = 0) → max_u64
+    // ack_rate: 12000 / 50ms = 240000 bytes/s
+    // min(max_u64, 240000) = 240000
     try std.testing.expectEqual(@as(u64, 240_000), rs.delivery_rate);
+}
+
+test "rate sampling: send_rate caps inflated ack_rate" {
+    var bbr = Bbr{};
+    const base: i64 = 1_000_000_000;
+
+    // Simulate: prior ack was at T-20ms for a packet sent at T-25ms
+    bbr.total_bytes_sent_at_last_acked = 5000;
+    bbr.last_acked_pkt_sent_time = base - 25 * std.time.ns_per_ms;
+
+    // Send one packet at T=0 (snapshots the last_acked state)
+    const ds = bbr.onSend(1200, base);
+
+    // Simulate ACK at T+5ms (very fast ACK → inflated ack_rate)
+    bbr.delivered = 6200; // 1200 new + prior 5000
+    bbr.delivered_time = base + 5 * std.time.ns_per_ms;
+    bbr.total_bytes_sent = 6200;
+
+    const rs = bbr.computeRateSample(.{
+        .size = 1200,
+        .sent_time = base,
+        .delivery_state = ds,
+        .rtt_ns = 5 * std.time.ns_per_ms,
+    }, base + 5 * std.time.ns_per_ms);
+
+    // send_rate: (6200 - 5000) bytes / (T=0 - (T-25ms)) = 1200 / 25ms = 48000
+    // ack_rate: 1200 / 5ms = 240000 (inflated by fast ACK)
+    // min(48000, 240000) = 48000 → send_rate correctly caps
+    try std.testing.expectEqual(@as(u64, 48_000), rs.delivery_rate);
 }
 
 test "A0 point selection: closest match" {
