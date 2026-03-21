@@ -1090,7 +1090,10 @@ pub const Bbr = struct {
     }
 
     fn checkProbeRTT(self: *Bbr, rs: RateSample, now: i64) void {
-        if (self.state != .probe_rtt and self.probe_rtt_expired and !self.idle_restart) {
+        // Don't enter ProbeRTT during Startup — bandwidth hasn't stabilized yet
+        if (self.state != .probe_rtt and self.probe_rtt_expired and
+            !self.idle_restart and self.state != .startup)
+        {
             self.enterProbeRTT();
             self.saveCwnd();
             self.probe_rtt_done_stamp = 0;
