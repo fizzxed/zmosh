@@ -206,11 +206,18 @@ pub const LossDetector = struct {
         now: i64,
         srtt_ns: i64,
         latest_rtt_ns: i64,
+        rttvar_ns: i64,
         retransmit_list: *std.ArrayListUnmanaged(u32),
     ) i64 {
         if (!self.has_largest_acked) return 0;
 
-        const loss_delay = @divFloor(time_threshold_num * @max(srtt_ns, latest_rtt_ns), time_threshold_den);
+        // Time threshold: max of the standard 9/8 multiplier and SRTT + 4*RTTVAR.
+        // The latter accounts for RTT variance and ACK processing delay, similar
+        // to QUIC's PTO formula (RFC 9002 §6.2.1). Without this, packets are
+        // declared lost before ACKs can realistically arrive.
+        const time_thresh = @divFloor(time_threshold_num * @max(srtt_ns, latest_rtt_ns), time_threshold_den);
+        const pto_thresh = srtt_ns + 4 * @max(rttvar_ns, std.time.ns_per_ms);
+        const loss_delay = @max(time_thresh, pto_thresh);
         var earliest_loss_time: i64 = 0;
 
         var seq = send_buf.head_seq;
@@ -521,7 +528,7 @@ test "LossDetector packet threshold" {
 
     var lost_buf: [64]u32 = undefined;
     var lost = std.ArrayListUnmanaged(u32).initBuffer(&lost_buf);
-    det.detectLosses(&send_buf, 100000, 50_000_000, 50_000_000, &lost);
+    det.detectLosses(&send_buf, 100000, 50_000_000, 50_000_000, 25_000_000, &lost);
 
     // Seq 1 is lost (4 - 1 = 3 >= threshold)
     try std.testing.expectEqual(@as(usize, 1), lost.items.len);

@@ -512,8 +512,9 @@ pub const Gateway = struct {
         // Loss detection -- uses Gateway's output-path SRTT (not Peer's)
         const srtt_ns: i64 = if (self.output_srtt_ns > 0) self.output_srtt_ns else 100 * std.time.ns_per_ms;
         const latest = if (self.output_latest_rtt_ns > 0) self.output_latest_rtt_ns else srtt_ns;
+        const rttvar = if (self.output_rttvar_ns > 0) self.output_rttvar_ns else @divFloor(srtt_ns, 2);
         const prev_queue_len = self.retransmit_queue.items.len;
-        self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
+        self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, rttvar, &self.retransmit_queue);
 
         // Only notify BBR about NEWLY detected losses (not already-queued ones)
         for (self.retransmit_queue.items[prev_queue_len..]) |lost_seq| {
@@ -545,8 +546,9 @@ pub const Gateway = struct {
     fn runLossDetection(self: *Gateway, now: i64) void {
         const srtt_ns: i64 = if (self.output_srtt_ns > 0) self.output_srtt_ns else 100 * std.time.ns_per_ms;
         const latest = if (self.output_latest_rtt_ns > 0) self.output_latest_rtt_ns else srtt_ns;
+        const rttvar = if (self.output_rttvar_ns > 0) self.output_rttvar_ns else @divFloor(srtt_ns, 2);
         const prev_queue_len = self.retransmit_queue.items.len;
-        self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
+        self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, rttvar, &self.retransmit_queue);
 
         // Only notify BBR about NEWLY detected losses
         for (self.retransmit_queue.items[prev_queue_len..]) |lost_seq| {
