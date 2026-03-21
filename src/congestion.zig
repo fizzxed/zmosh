@@ -254,7 +254,13 @@ pub const Bbr = struct {
     // --- Idle restart ---
     idle_restart: bool = false,
 
+    // --- Startup high-loss tracking ---
+    startup_loss_events: u32 = 0, // discontiguous loss events in current round
+    bytes_lost_in_round: u64 = 0, // bytes lost in current round
+
     // --- Undo state (for spurious loss recovery) ---
+    undo_state: BbrState = .startup,
+    undo_probe_bw_phase: ProbeBwPhase = .down,
     undo_bw_shortterm: u64 = max_u64,
     undo_inflight_shortterm: u32 = max_u32,
     undo_inflight_longterm: u32 = max_u32,
@@ -362,6 +368,7 @@ pub const Bbr = struct {
     pub fn onLoss(self: *Bbr, pkt_size: u32, lost: u64, tx_in_flight: u32, is_app_limited: bool) void {
         self.inflight -|= pkt_size;
         self.total_lost += pkt_size;
+        self.bytes_lost_in_round += pkt_size;
 
         // BBRNoteLoss (spec 5.5.10.2)
         if (!self.loss_in_round) {
@@ -370,7 +377,11 @@ pub const Bbr = struct {
         }
         self.loss_in_round = true;
 
-        if (!self.bw_probe_samples) return;
+        // Count discontiguous loss events during Startup (for D8 criterion 3)
+        if (!self.bw_probe_samples) {
+            self.startup_loss_events += 1;
+            return;
+        }
 
         // Check IsInflightTooHigh using cumulative lost/tx_in_flight
         if (isInflightTooHigh(lost, tx_in_flight)) {
@@ -515,6 +526,8 @@ pub const Bbr = struct {
         self.loss_in_round = false;
         self.bw_latest = 0;
         self.inflight_latest = 0;
+        self.startup_loss_events = 0;
+        self.bytes_lost_in_round = 0;
     }
 
     fn updateCongestionSignals(self: *Bbr, rs: RateSample, now: i64) void {
@@ -528,6 +541,8 @@ pub const Bbr = struct {
 
         self.adaptLowerBoundsFromCongestion();
         self.loss_in_round = false;
+        self.startup_loss_events = 0;
+        self.bytes_lost_in_round = 0;
     }
 
     fn updateMaxBw(self: *Bbr, rs: RateSample) void {
@@ -640,26 +655,29 @@ pub const Bbr = struct {
     }
 
     fn checkStartupHighLoss(self: *Bbr, rs: RateSample) void {
-        if (self.state != .startup) return;
-        if (!self.round_start or !self.loss_in_round) return;
         _ = rs;
+        if (self.state != .startup) return;
 
-        // Spec: requires BOTH loss_events (we track loss_in_round as bool)
-        // AND IsInflightTooHigh. For simplicity, we check loss_in_round only
-        // (we don't track per-round loss event count separately from onLoss).
-        // The full_bw_reached is set, and inflight_longterm is set to safe level.
-        // Since we track loss_in_round as a bool, we rely on onLoss having set
-        // bw_probe_samples = false and reduced inflight_longterm already.
-        // For the startup exit, we just need full_bw_reached = true.
+        // Spec 5.3.1.3: ALL three criteria must be met:
+        // 1. A loss round has completed (loss_round_start is set)
+        if (!self.loss_round_start) return;
+        // 2. Loss rate exceeds LossThresh (2%): bytes_lost_in_round / inflight_latest > 2%
+        if (!self.loss_in_round) return;
+        if (self.inflight_latest == 0) return;
+        const loss_rate_high = self.bytes_lost_in_round * loss_thresh_den >
+            self.inflight_latest * loss_thresh_num;
+        if (!loss_rate_high) return;
+        // 3. At least StartupFullLossCnt (6) discontiguous loss events in round
+        if (self.startup_loss_events < startup_full_loss_cnt) return;
+
+        // Exit Startup due to high loss
         self.full_bw_reached = true;
-        if (self.inflight_longterm == max_u32) {
-            // Set inflight_longterm = max(bdp, inflight_latest)
-            const bdp_val = self.bdp();
-            self.inflight_longterm = @intCast(@min(
-                @max(bdp_val, self.inflight_latest),
-                max_u32,
-            ));
-        }
+        // inflight_longterm = max(bdp, inflight_latest)
+        const bdp_val = self.bdp();
+        self.inflight_longterm = @intCast(@min(
+            @max(bdp_val, self.inflight_latest),
+            max_u32,
+        ));
     }
 
     fn enterStartup(self: *Bbr) void {
@@ -791,13 +809,12 @@ pub const Bbr = struct {
     }
 
     fn isTimeToGoDown(self: *Bbr, rs: RateSample) bool {
-        _ = rs;
         // Spec: if cwnd-limited and cwnd >= inflight_longterm, reset fullBW
         // We approximate is_cwnd_limited as (inflight >= cwnd - max_datagram_size)
         const cwnd_limited = (self.inflight + max_datagram_size >= self.cwnd);
         if (cwnd_limited and self.cwnd >= self.inflight_longterm) {
             self.resetFullBW();
-            self.full_bw = self.max_bw; // use max_bw as proxy for RS.delivery_rate
+            self.full_bw = rs.delivery_rate; // spec: BBR.full_bw = RS.delivery_rate
         } else if (self.full_bw_now) {
             return true;
         }
@@ -970,9 +987,43 @@ pub const Bbr = struct {
     }
 
     fn saveStateUponLoss(self: *Bbr) void {
+        self.undo_state = self.state;
+        self.undo_probe_bw_phase = self.probe_bw_phase;
         self.undo_bw_shortterm = self.bw_shortterm;
         self.undo_inflight_shortterm = self.inflight_shortterm;
         self.undo_inflight_longterm = self.inflight_longterm;
+    }
+
+    /// BBRHandleSpuriousLossDetection (spec 5.5.11.2)
+    /// Called when a loss recovery episode is declared spurious.
+    pub fn handleSpuriousLossDetection(self: *Bbr) void {
+        self.loss_in_round = false;
+        self.resetFullBW();
+        self.bw_shortterm = @max(self.bw_shortterm, self.undo_bw_shortterm);
+        self.inflight_shortterm = @max(self.inflight_shortterm, self.undo_inflight_shortterm);
+        self.inflight_longterm = @max(self.inflight_longterm, self.undo_inflight_longterm);
+        // If flow was probing bandwidth, return to that state
+        const undo_is_probe_bw_up = (self.undo_state == .probe_bw and
+            self.undo_probe_bw_phase == .up);
+        const same_state = (self.state == self.undo_state) and
+            (self.state != .probe_bw or self.probe_bw_phase == self.undo_probe_bw_phase);
+        if (self.state != .probe_rtt and !same_state) {
+            if (self.undo_state == .startup) {
+                self.enterStartup();
+            } else if (undo_is_probe_bw_up) {
+                // undo_state == ProbeBW_UP: use max_bw as proxy for RS.delivery_rate
+                const dummy_rs = RateSample{ .delivery_rate = self.max_bw };
+                self.startProbeBW_UP(dummy_rs, self.cycle_stamp);
+            }
+        }
+    }
+
+    /// BBROnEnterRTO (spec 5.6.4.4): severe loss response (RTO-equivalent).
+    /// Saves cwnd and state, then reduces cwnd to allow 1 packet.
+    pub fn onSevereLoss(self: *Bbr) void {
+        self.saveCwnd();
+        self.saveStateUponLoss();
+        self.cwnd = @as(u32, self.inflight) +| max_datagram_size;
     }
 
     // ------------------------------------------------------------------
@@ -1111,7 +1162,6 @@ pub const Bbr = struct {
         if (self.state == .probe_bw and self.probe_bw_phase != .cruise) {
             cap = @as(u64, self.inflight_longterm);
         } else if (self.state == .probe_rtt or
-            self.state == .drain or
             (self.state == .probe_bw and self.probe_bw_phase == .cruise))
         {
             cap = @as(u64, self.inflightWithHeadroom());
