@@ -512,13 +512,7 @@ pub const Bbr = struct {
     }
 
     pub fn canSend(self: *const Bbr) bool {
-        // For terminal traffic, the flow control window (receiver-advertised
-        // max_offset) is the primary congestion signal. BBR's cwnd-based
-        // gating causes hangs when inflight slightly exceeds cwnd during
-        // burst/drain transitions. The pacer and flow control provide
-        // sufficient rate limiting.
-        _ = self;
-        return true;
+        return self.inflight < self.cwnd or self.inflight < min_cwnd;
     }
 
     pub fn setAppLimited(self: *Bbr) void {

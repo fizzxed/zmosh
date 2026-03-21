@@ -271,18 +271,19 @@ pub const Gateway = struct {
 
             if (now - self.last_stats_ns >= 2 * std.time.ns_per_s) {
                 const srtt_ms: i64 = if (self.output_srtt_ns > 0) @divFloor(self.output_srtt_ns, std.time.ns_per_ms) else -1;
-                debugWrite(self.debug_log, "S offset={d} pending={d} retx={d} inflight={d} cwnd={d} bw={d} state={d} lost={d} srtt={d} pkts={d} burst={d} flow={d}\n", .{
+                debugWrite(self.debug_log, "S off={d} pend={d} infl={d} cwnd={d} bw={d} s={d}.{d} lost={d} srtt={d} maxinfl={d} il={d} is={d} flow={d}\n", .{
                     self.output_offset,
                     self.pending_output.items.len,
-                    self.retransmit_queue.items.len,
                     self.bbr.inflight,
                     self.bbr.cwnd,
                     self.bbr.bw,
                     @intFromEnum(self.bbr.state),
+                    @intFromEnum(self.bbr.probe_bw_phase),
                     self.bbr.total_lost,
                     srtt_ms,
-                    self.output_pkts_sent,
-                    self.pacer.burst_remaining,
+                    self.bbr.max_inflight,
+                    self.bbr.inflight_longterm,
+                    self.bbr.inflight_shortterm,
                     self.client_max_offset,
                 });
                 self.last_stats_ns = now;
