@@ -516,15 +516,27 @@ pub const Bbr = struct {
     /// Compute delivery rate sample per spec §4.1.1.2.4:
     ///   delivery_elapsed = max(ack_elapsed, send_elapsed)
     ///   delivery_rate = data_acked / delivery_elapsed
-    /// This is equivalent to min(send_rate, ack_rate) since both share
-    /// the same numerator (data_acked).
+    ///
+    /// Enhancement (Google/Cloudflare overestimate avoidance): when A0
+    /// points are available, widen ack_elapsed to span the full ACK
+    /// aggregation epoch, preventing burst ACK compression from inflating
+    /// the rate. The numerator (data_acked) stays the same per spec.
     fn computeRateSample(self: *const Bbr, pkt: AckedPacket, now: i64) RateSample {
         const ds = pkt.delivery_state;
         const delivered_delta = self.delivered - ds.delivered;
         if (delivered_delta == 0) return .{ .prior_delivered = ds.delivered };
 
         const send_elapsed = pkt.sent_time - ds.first_sent_time;
-        const ack_elapsed = now - ds.delivered_time;
+        // Use A0 point for ack_elapsed if available (wider baseline)
+        const ack_elapsed = blk: {
+            if (self.a0_count > 0) {
+                if (self.selectA0(ds.delivered)) |a0| {
+                    const elapsed = now - a0.ack_time;
+                    if (elapsed > 0) break :blk elapsed;
+                }
+            }
+            break :blk now - ds.delivered_time;
+        };
         const interval = @max(send_elapsed, ack_elapsed);
 
         // Discard samples with unreliably short intervals.
@@ -1182,7 +1194,8 @@ pub const Bbr = struct {
     fn bdpMultiple(self: *const Bbr, gain: u32) u64 {
         if (self.min_rtt == max_i64) return @as(u64, initial_cwnd);
         const bdp_val = self.bw * @as(u64, @intCast(self.min_rtt)) / ns_per_s;
-        return bdp_val * @as(u64, gain) / 256;
+        // u128 for gain multiply: bdp_val * 709 can approach u64 max on fast/high-RTT paths
+        return @intCast(@min(@as(u128, bdp_val) * gain / 256, max_u32));
     }
 
     // NOTE: BBRSetSendQuantum (spec §5.6.3) is intentionally not implemented.
