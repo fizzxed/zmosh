@@ -227,10 +227,14 @@ export fn zmosh_connect(
     };
     errdefer reliable_send.deinit();
 
-    // Send Init with terminal size (reliable)
-    const size = ipc.Resize{ .rows = rows, .cols = cols };
+    // Send Init with terminal size + receive buffer capacity (reliable)
+    const init_msg = ipc.InitMsg{
+        .rows = rows,
+        .cols = cols,
+        .recv_buf_size = udp_mod.UdpSocket.getSocketBufSize(sock_fd, posix.SO.RCVBUF),
+    };
     var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
+    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&init_msg), &init_buf);
 
     const init_packet = reliable_send.buildAndTrack(.reliable_ipc, init_ipc, 0, 0, now) catch {
         reliable_send.deinit();

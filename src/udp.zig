@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const builtin = @import("builtin");
 const crypto = @import("crypto.zig");
 
 const log = std.log.scoped(.udp);
@@ -46,16 +47,17 @@ pub const UdpSocket = struct {
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&size)) catch {};
     }
 
-    /// Query the actual receive buffer the kernel granted (may be less than
-    /// requested if rmem_max is low). Returns the size in bytes, or a
-    /// conservative default if the query fails. Note: Linux doubles the
-    /// setsockopt value (half is for kernel overhead), so the usable
-    /// space is approximately the returned value / 2.
-    pub fn getRecvBufSize(fd: posix.fd_t) u32 {
-        var size: i32 = 0;
-        var len: u32 = @sizeOf(i32);
-        const rc = std.os.linux.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&size), &len);
-        return if (rc == 0 and size > 0) @intCast(size) else 212992; // fallback = default rmem
+    /// Query the actual send buffer the kernel granted (may be less than
+    /// requested if wmem_max is low). This limits how much the server can
+    /// burst via sendto() before EAGAIN. Linux doubles the setsockopt
+    /// value (half for kernel overhead), so usable ≈ raw / 2.
+    pub fn getSocketBufSize(fd: posix.fd_t, comptime opt: u32) u32 {
+        const c = std.c;
+        var size: c_int = 0;
+        var len: posix.socklen_t = @sizeOf(c_int);
+        const rc = c.getsockopt(fd, posix.SOL.SOCKET, @intCast(opt), @ptrCast(&size), &len);
+        if (rc == 0 and size > 0) return @intCast(size);
+        return if (builtin.os.tag == .linux) 212992 else target_buf_size;
     }
 
     fn bindFamily(family: u32, port_start: u16, port_end: u16, set_v6only: bool) ?UdpSocket {

@@ -31,6 +31,14 @@ pub const Resize = packed struct {
     cols: u16,
 };
 
+pub const InitMsg = packed struct {
+    rows: u16,
+    cols: u16,
+    /// Client's UDP receive buffer size in bytes. The server uses this to
+    /// cap BBR's cwnd so bursts don't overflow the client's kernel buffer.
+    recv_buf_size: u32 = 0,
+};
+
 pub fn getTerminalSize(fd: i32) Resize {
     var ws: cross.c.struct_winsize = undefined;
     if (cross.c.ioctl(fd, cross.c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {

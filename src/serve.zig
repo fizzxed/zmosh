@@ -207,12 +207,17 @@ pub const Gateway = struct {
             .last_resize = .{ .rows = 24, .cols = 80 },
         };
         gw.retransmit_queue = std.ArrayListUnmanaged(u32).initBuffer(&gw.retransmit_buf);
-        // Cap BBR's cwnd to the receiver's UDP socket buffer. Since both
-        // sides run the same binary with the same buffer request, the local
-        // buffer is a good proxy. Linux doubles the setsockopt value (half
-        // for kernel overhead), so usable capacity ≈ raw_size / 2.
-        const recv_buf = udp.UdpSocket.getRecvBufSize(udp_sock.fd);
-        gw.bbr.max_cwnd = recv_buf / 2;
+        // Cap BBR's cwnd to prevent receiver-side UDP buffer overflow.
+        // The receiver's kernel silently drops datagrams that don't fit
+        // in SO_RCVBUF between poll() wakeups. We can't know the remote
+        // receiver's buffer without a protocol extension, so use the
+        // local socket's actual buffer as a conservative estimate.
+        // Linux: rmem_default=212992, kernel doubles it, usable ≈ 212992/2.
+        // macOS: udp.recvspace=786896, larger — Linux is the limiting case.
+        // Default max_cwnd from server's send buffer (conservative fallback).
+        // Will be updated when the client's Init message arrives with its recv_buf_size.
+        const sock_sndbuf = udp.UdpSocket.getSocketBufSize(udp_sock.fd, posix.SO.SNDBUF);
+        gw.bbr.max_cwnd = @max(sock_sndbuf / 2, congestion.min_cwnd);
 
         gw.debug_log = std.fs.createFileAbsolute("/tmp/zmosh-server-debug.log", .{ .truncate = true }) catch null;
         debugWrite(gw.debug_log, "zmosh server debug started max_cwnd={d}\n", .{gw.bbr.max_cwnd});
@@ -695,8 +700,16 @@ pub const Gateway = struct {
 
             const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
             const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
-            if ((hdr.tag == .Init or hdr.tag == .Resize) and msg_payload.len == @sizeOf(ipc.Resize)) {
-                self.last_resize = std.mem.bytesToValue(ipc.Resize, msg_payload);
+            if (hdr.tag == .Init and msg_payload.len >= @sizeOf(ipc.InitMsg)) {
+                const init_msg = std.mem.bytesToValue(ipc.InitMsg, msg_payload[0..@sizeOf(ipc.InitMsg)]);
+                self.last_resize = .{ .rows = init_msg.rows, .cols = init_msg.cols };
+                self.have_client_size = true;
+                if (init_msg.recv_buf_size > 0) {
+                    self.bbr.max_cwnd = @max(init_msg.recv_buf_size / 2, congestion.min_cwnd);
+                    debugWrite(self.debug_log, "CLIENT_RCVBUF={d} max_cwnd={d}\n", .{ init_msg.recv_buf_size, self.bbr.max_cwnd });
+                }
+            } else if ((hdr.tag == .Init or hdr.tag == .Resize) and msg_payload.len >= @sizeOf(ipc.Resize)) {
+                self.last_resize = std.mem.bytesToValue(ipc.Resize, msg_payload[0..@sizeOf(ipc.Resize)]);
                 self.have_client_size = true;
             }
 

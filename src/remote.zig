@@ -359,10 +359,15 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var output_pkts_this_interval: u64 = 0;
     var last_output_pkt_ns: i64 = 0;
 
-    // Send Init message with terminal size (reliable)
-    const size = getTerminalSize();
+    // Send Init message with terminal size + receive buffer capacity (reliable)
+    const term_size = getTerminalSize();
+    const init_msg = ipc.InitMsg{
+        .rows = term_size.rows,
+        .cols = term_size.cols,
+        .recv_buf_size = udp_mod.UdpSocket.getSocketBufSize(sock_fd, posix.SO.RCVBUF),
+    };
     var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&size), &init_buf);
+    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&init_msg), &init_buf);
     try sendReliablePayload(&peer, &udp_sock, &reliable_send, &reliable_recv, .reliable_ipc, init_ipc, last_ack_send_ns);
 
     while (true) {
