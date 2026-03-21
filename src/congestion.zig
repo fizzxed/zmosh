@@ -531,47 +531,26 @@ pub const Bbr = struct {
     // Internal: Delivery Rate Sample
     // ------------------------------------------------------------------
 
-    /// Google/Cloudflare bandwidth sampler: min(send_rate, ack_rate).
+    /// Delivery rate sample per spec §4.1.1.2.4:
+    ///   delivery_rate = data_acked / max(ack_elapsed, send_elapsed)
     ///
-    /// send_rate uses bytes sent between the last-acked packet (when this
-    /// packet was sent) and now, divided by the send time delta. Bounded
-    /// by ~1 cwnd: max send_bytes * 1e9 ≈ 4GB * 1e9 = 4e18, fits u64.
-    ///
-    /// ack_rate uses A0 points for a stable baseline spanning the full
-    /// ACK aggregation epoch, preventing burst compression. Bounded by
-    /// bytes acked since epoch start: similar magnitude.
+    /// This is equivalent to min(send_rate, ack_rate) when both share
+    /// data_acked as numerator. Using max(elapsed) as denominator is
+    /// better for bursty terminal traffic than Google's separate-numerator
+    /// approach, which penalizes idle periods between bursts.
     fn computeRateSample(self: *const Bbr, pkt: AckedPacket, now: i64) RateSample {
         const ds = pkt.delivery_state;
         const delivered_delta = self.delivered - ds.delivered;
         if (delivered_delta == 0) return .{ .prior_delivered = ds.delivered };
 
-        // --- send_rate ---
-        // Numerator: bytes sent since "last acked pkt when this was sent"
-        const send_bytes = self.total_bytes_sent -| ds.total_bytes_sent_at_last_acked;
-        // Denominator: time between this pkt's send and the last-acked's send
-        const send_elapsed = pkt.sent_time - ds.last_acked_pkt_sent_time;
+        const send_elapsed = pkt.sent_time - ds.first_sent_time;
+        const ack_elapsed = now - ds.delivered_time;
+        const interval = @max(send_elapsed, ack_elapsed);
 
-        // --- ack_rate ---
-        // Use A0 point for widest valid baseline; fallback to delivery state
-        var ack_bytes: u64 = delivered_delta;
-        var ack_elapsed: i64 = now - ds.delivered_time;
-        if (self.a0_count > 0) {
-            if (self.selectA0(ds.delivered)) |a0| {
-                const elapsed = now - a0.ack_time;
-                if (elapsed > 0) {
-                    ack_bytes = self.delivered -| a0.total_bytes_acked;
-                    ack_elapsed = elapsed;
-                }
-            }
-        }
-
-        // 1ms floor: discard rates from sub-millisecond intervals.
-        // Before first RTT sample, this prevents degenerate TB/s estimates.
-        const floor_ns: i64 = std.time.ns_per_ms;
-        const send_ok = ds.last_acked_pkt_sent_time > 0 and send_elapsed >= floor_ns;
-        const ack_ok = ack_elapsed >= floor_ns;
-
-        if (!send_ok and !ack_ok) {
+        // 1ms floor: before first RTT sample, prevents degenerate TB/s estimates.
+        const min_rtt_val = self.getMinRtt();
+        const min_interval: i64 = if (min_rtt_val > 0) min_rtt_val else std.time.ns_per_ms;
+        if (interval < min_interval) {
             return .{
                 .rtt_ns = pkt.rtt_ns,
                 .delivered = delivered_delta,
@@ -581,16 +560,7 @@ pub const Bbr = struct {
             };
         }
 
-        // Each rate: bytes/sec. Invalid → max_u64 so min() picks the other.
-        const send_rate: u64 = if (send_ok)
-            send_bytes * ns_per_s / @as(u64, @intCast(send_elapsed))
-        else
-            max_u64;
-        const ack_rate: u64 = if (ack_ok)
-            ack_bytes * ns_per_s / @as(u64, @intCast(ack_elapsed))
-        else
-            max_u64;
-        const rate = @min(send_rate, ack_rate);
+        const rate = delivered_delta * ns_per_s / @as(u64, @intCast(interval));
 
         return .{
             .delivery_rate = rate,
@@ -1691,21 +1661,19 @@ test "rate sampling: burst send, ack_rate wins via min" {
     try std.testing.expectEqual(@as(u64, 240_000), rs.delivery_rate);
 }
 
-test "rate sampling: send_rate caps inflated ack_rate" {
+test "rate sampling: max interval caps short ack_elapsed" {
     var bbr = Bbr{};
     const base: i64 = 1_000_000_000;
 
-    // Simulate: prior ack was at T-20ms for a packet sent at T-25ms
-    bbr.total_bytes_sent_at_last_acked = 5000;
-    bbr.last_acked_pkt_sent_time = base - 25 * std.time.ns_per_ms;
-
-    // Send one packet at T=0 (snapshots the last_acked state)
+    // Send one packet at T=0 with first_sent_time = T-25ms
+    bbr.first_sent_time = base - 25 * std.time.ns_per_ms;
+    bbr.delivered_time = base - 5 * std.time.ns_per_ms;
     const ds = bbr.onSend(1200, base);
 
-    // Simulate ACK at T+5ms (very fast ACK → inflated ack_rate)
-    bbr.delivered = 6200; // 1200 new + prior 5000
+    // Simulate ACK at T+5ms
+    bbr.delivered = 1200;
     bbr.delivered_time = base + 5 * std.time.ns_per_ms;
-    bbr.total_bytes_sent = 6200;
+    bbr.min_rtt = 5 * std.time.ns_per_ms;
 
     const rs = bbr.computeRateSample(.{
         .size = 1200,
@@ -1714,9 +1682,10 @@ test "rate sampling: send_rate caps inflated ack_rate" {
         .rtt_ns = 5 * std.time.ns_per_ms,
     }, base + 5 * std.time.ns_per_ms);
 
-    // send_rate: (6200 - 5000) bytes / (T=0 - (T-25ms)) = 1200 / 25ms = 48000
-    // ack_rate: 1200 / 5ms = 240000 (inflated by fast ACK)
-    // min(48000, 240000) = 48000 → send_rate correctly caps
+    // send_elapsed = T=0 - (T-25ms) = 25ms
+    // ack_elapsed = (T+5ms) - (T-5ms) = 10ms
+    // interval = max(25ms, 10ms) = 25ms
+    // rate = 1200 / 25ms = 48000
     try std.testing.expectEqual(@as(u64, 48_000), rs.delivery_rate);
 }
 
