@@ -73,8 +73,14 @@ pub const Gateway = struct {
     loss_detector: loss.LossDetector,
     retransmit_buf: [64]u32,
     retransmit_queue: std.ArrayListUnmanaged(u32),
-    latest_rtt_ns: i64,
     loss_detection_timer: i64, // ns, 0 = no timer
+
+    // Output-path RTT tracking (separate from Peer's RTT for reliable IPC).
+    // Per spec §4.2: RS.rtt = Now() - P.send_time, computed per-packet.
+    // Peer's RTT measures heartbeat-to-heartbeat which inflates during idle.
+    output_srtt_ns: i64 = 0,
+    output_rttvar_ns: i64 = 0,
+    output_latest_rtt_ns: i64 = 0,
 
     config: udp.Config,
     running: bool,
@@ -162,7 +168,9 @@ pub const Gateway = struct {
             .loss_detector = .{},
             .retransmit_buf = undefined,
             .retransmit_queue = undefined,
-            .latest_rtt_ns = 0,
+            .output_srtt_ns = 0,
+            .output_rttvar_ns = 0,
+            .output_latest_rtt_ns = 0,
             .loss_detection_timer = 0,
             .config = config,
             .running = true,
@@ -233,12 +241,6 @@ pub const Gateway = struct {
             // Handle incoming UDP datagrams → decrypt → decode transport packet
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
                 while (true) {
-                    // Suppress Peer.recv() RTT measurement on the server side.
-                    // Must be BEFORE recv() so it sees null and skips measurement.
-                    // Peer.recv() measures last-send-to-next-recv which during idle
-                    // is just the heartbeat interval (~1s), not true RTT. BBR's
-                    // processOutputAcks provides accurate per-packet RTT instead.
-                    self.peer.last_send_time = null;
                     var decrypt_buf: [9000]u8 = undefined;
                     const recv_result = try self.peer.recv(&self.udp_sock, &decrypt_buf);
                     const result = recv_result orelse break;
@@ -386,8 +388,8 @@ pub const Gateway = struct {
             const chunk = self.pending_output.items[0..end];
             const seq = self.output_seq;
 
-            // Record in send buffer with delivery state for BBR
-            const ds = self.bbr.getDeliveryState();
+            // OnPacketSent: init + snapshot + update inflight (spec §4.1.2.2)
+            const ds = self.bbr.onSend(@intCast(chunk.len), now);
             self.send_buf.recordSend(seq, chunk, now, ds);
 
             var pkt_buf: [1200]u8 = undefined;
@@ -409,7 +411,6 @@ pub const Gateway = struct {
                 return err;
             };
 
-            self.bbr.onSend(@intCast(chunk.len), now);
             self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate);
             self.output_seq +%= 1;
 
@@ -443,12 +444,13 @@ pub const Gateway = struct {
                 const n = handler.ctx_inner.now_ns;
                 const entry = gw.send_buf.markAcked(seq) orelse return;
 
-                // RTT: Karn's algorithm — only use non-retransmitted packets
+                // RTT: Karn's algorithm — only use non-retransmitted packets.
+                // Update Gateway's own SRTT (not Peer's — Peer measures
+                // heartbeat-to-heartbeat which inflates during idle).
                 if (entry.retransmit_count == 0) {
                     const rtt_ns = n - entry.sent_time;
                     if (rtt_ns > 0) {
-                        gw.latest_rtt_ns = rtt_ns;
-                        gw.peer.updateRtt(@divFloor(rtt_ns, std.time.ns_per_us));
+                        gw.updateOutputRtt(rtt_ns);
                     }
                 }
 
@@ -464,9 +466,9 @@ pub const Gateway = struct {
 
         ranges.iterateAcked(Handler{ .ctx_inner = ctx });
 
-        // Loss detection
-        const srtt_ns: i64 = if (self.peer.srtt_us) |s| s * std.time.ns_per_us else 100 * std.time.ns_per_ms;
-        const latest = if (self.latest_rtt_ns > 0) self.latest_rtt_ns else srtt_ns;
+        // Loss detection — uses Gateway's output-path SRTT (not Peer's)
+        const srtt_ns: i64 = if (self.output_srtt_ns > 0) self.output_srtt_ns else 100 * std.time.ns_per_ms;
+        const latest = if (self.output_latest_rtt_ns > 0) self.output_latest_rtt_ns else srtt_ns;
         self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
         // Notify BBR about losses (peek, don't remove — retransmitted by sendPacedOutput)
@@ -481,11 +483,24 @@ pub const Gateway = struct {
         self.send_buf.pruneAcked();
     }
 
+    /// Update output-path RTT estimate (RFC 6298 EWMA, separate from Peer).
+    fn updateOutputRtt(self: *Gateway, rtt_ns: i64) void {
+        self.output_latest_rtt_ns = rtt_ns;
+        if (self.output_srtt_ns > 0) {
+            const diff = if (self.output_srtt_ns > rtt_ns) self.output_srtt_ns - rtt_ns else rtt_ns - self.output_srtt_ns;
+            self.output_rttvar_ns = @divFloor(3 * self.output_rttvar_ns, 4) + @divFloor(diff, 4);
+            self.output_srtt_ns = @divFloor(7 * self.output_srtt_ns, 8) + @divFloor(rtt_ns, 8);
+        } else {
+            self.output_srtt_ns = rtt_ns;
+            self.output_rttvar_ns = @divFloor(rtt_ns, 2);
+        }
+    }
+
     /// Timer-triggered loss detection (RFC 9002 §6.1.2).
     /// Called when loss_detection_timer fires without an ACK arrival.
     fn runLossDetection(self: *Gateway, now: i64) void {
-        const srtt_ns: i64 = if (self.peer.srtt_us) |s| s * std.time.ns_per_us else 100 * std.time.ns_per_ms;
-        const latest = if (self.latest_rtt_ns > 0) self.latest_rtt_ns else srtt_ns;
+        const srtt_ns: i64 = if (self.output_srtt_ns > 0) self.output_srtt_ns else 100 * std.time.ns_per_ms;
+        const latest = if (self.output_latest_rtt_ns > 0) self.output_latest_rtt_ns else srtt_ns;
         self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
         for (self.retransmit_queue.items) |lost_seq| {
@@ -665,7 +680,9 @@ pub const Gateway = struct {
             .loss_detector = .{},
             .retransmit_buf = undefined,
             .retransmit_queue = undefined,
-            .latest_rtt_ns = 0,
+            .output_srtt_ns = 0,
+            .output_rttvar_ns = 0,
+            .output_latest_rtt_ns = 0,
             .loss_detection_timer = 0,
             .config = .{},
             .running = true,

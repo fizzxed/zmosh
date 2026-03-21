@@ -266,8 +266,25 @@ pub const Bbr = struct {
     // Public API
     // ------------------------------------------------------------------
 
-    pub fn getDeliveryState(self: *const Bbr) DeliveryState {
-        return .{
+    /// OnPacketSent (spec §4.1.2.2): initialize, update inflight, snapshot.
+    /// Returns the delivery state to record in the send buffer.
+    /// Replaces the old separate getDeliveryState() + onSend() pair.
+    pub fn onSend(self: *Bbr, bytes: u32, now: i64) DeliveryState {
+        // BBRHandleRestartFromIdle (spec 5.4.1)
+        self.handleRestartFromIdle(now);
+
+        // Spec §4.1.2.2: "if (C.inflight == 0)"
+        // Reset timestamps so the first packet in a flight gets valid values.
+        if (self.inflight == 0) {
+            self.first_sent_time = now;
+            self.delivered_time = now;
+        }
+
+        // Update inflight BEFORE snapshot (spec: P.tx_in_flight includes P)
+        self.inflight += bytes;
+
+        // Snapshot delivery state (spec: P.delivered_time = C.delivered_time, etc.)
+        const ds = DeliveryState{
             .delivered = self.delivered,
             .delivered_time = self.delivered_time,
             .first_sent_time = self.first_sent_time,
@@ -275,20 +292,12 @@ pub const Bbr = struct {
             .tx_in_flight = self.inflight,
             .lost = self.total_lost,
         };
-    }
 
-    pub fn onSend(self: *Bbr, bytes: u32, now: i64) void {
-        // BBRHandleRestartFromIdle (spec 5.4.1)
-        self.handleRestartFromIdle(now);
+        // Spec §4.1.2.2: C.first_send_time = P.send_time (for next packet)
+        self.first_sent_time = now;
 
-        self.inflight += bytes;
-        if (self.first_sent_time == 0) {
-            self.first_sent_time = now;
-            self.delivered_time = now;
-        }
-
-        // Clear app-limited once we've sent enough to fill the pipe (spec 4.1.2)
-        if (self.is_app_limited and self.delivered + self.inflight >= self.app_limited_seq) {
+        // Clear app-limited once we've sent enough to fill the pipe (spec 4.1.2.4)
+        if (self.is_app_limited and self.delivered + self.inflight > self.app_limited_seq) {
             self.is_app_limited = false;
         }
 
@@ -296,12 +305,19 @@ pub const Bbr = struct {
         if (self.rng_state == 0) {
             self.rng_state = @as(u64, @bitCast(now)) | 1;
         }
+
+        return ds;
     }
 
     pub fn onAck(self: *Bbr, pkt: AckedPacket, newly_acked: u32, now: i64) void {
         self.inflight -|= pkt.size;
         self.delivered += pkt.size;
         self.delivered_time = now;
+
+        // GenerateRateSample: clear app-limited if bubble is ACKed (spec §4.1.2.3)
+        if (self.is_app_limited and self.delivered > self.app_limited_seq) {
+            self.is_app_limited = false;
+        }
 
         // Compute delivery rate sample
         var rs = self.computeRateSample(pkt, now);
@@ -419,21 +435,20 @@ pub const Bbr = struct {
         const delivered_delta = self.delivered - ds.delivered;
         if (delivered_delta == 0) return .{};
 
-        // Skip bogus samples: if delivered_time or first_sent_time was 0
-        // at send time, the elapsed calculation would use time-since-epoch
-        // producing near-zero delivery rate.
-        if (ds.delivered_time == 0 or ds.first_sent_time == 0) {
+        const send_elapsed = pkt.sent_time - ds.first_sent_time;
+        const ack_elapsed = now - ds.delivered_time;
+        var interval = @max(send_elapsed, ack_elapsed);
+        if (interval <= 0) interval = 1;
+
+        // Spec §4.1.2.3: discard unreliably short intervals
+        const min_rtt_val = self.getMinRtt();
+        if (min_rtt_val > 0 and interval < min_rtt_val) {
             return .{
                 .rtt_ns = pkt.rtt_ns,
                 .delivered = delivered_delta,
                 .tx_in_flight = ds.tx_in_flight,
             };
         }
-
-        const send_elapsed = pkt.sent_time - ds.first_sent_time;
-        const ack_elapsed = now - ds.delivered_time;
-        var interval = @max(send_elapsed, ack_elapsed);
-        if (interval <= 0) interval = 1;
 
         const rate = delivered_delta * ns_per_s / @as(u64, @intCast(interval));
 
@@ -1187,10 +1202,10 @@ test "Bbr onSend tracks inflight" {
     var bbr = Bbr{};
     const now: i64 = 1_000_000_000;
 
-    bbr.onSend(1200, now);
+    _ = bbr.onSend(1200, now);
     try std.testing.expectEqual(@as(u32, 1200), bbr.inflight);
 
-    bbr.onSend(1200, now + 1000);
+    _ = bbr.onSend(1200, now + 1000);
     try std.testing.expectEqual(@as(u32, 2400), bbr.inflight);
 }
 
@@ -1198,9 +1213,8 @@ test "Bbr onAck updates delivery and max_bw" {
     var bbr = Bbr{};
     const t0: i64 = 1_000_000_000;
 
-    // Simulate sending
-    const ds = bbr.getDeliveryState();
-    bbr.onSend(1200, t0);
+    // onSend returns DeliveryState (combined init+snapshot per spec §4.1.2.2)
+    const ds = bbr.onSend(1200, t0);
 
     // Simulate ACK arriving 50ms later
     const t1 = t0 + 50 * std.time.ns_per_ms;
@@ -1223,8 +1237,7 @@ test "Bbr startup to drain transition" {
     // Send many packets with stable delivery rate to trigger full-pipe detection
     var seq: u32 = 0;
     while (seq < 100) : (seq += 1) {
-        const ds = bbr.getDeliveryState();
-        bbr.onSend(1200, now);
+        const ds = bbr.onSend(1200, now);
         now += 1 * std.time.ns_per_ms;
 
         bbr.onAck(.{
