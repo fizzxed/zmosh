@@ -525,12 +525,14 @@ pub const Bbr = struct {
 
         const send_elapsed = pkt.sent_time - ds.first_sent_time;
         const ack_elapsed = now - ds.delivered_time;
-        var interval = @max(send_elapsed, ack_elapsed);
-        if (interval <= 0) interval = 1;
+        const interval = @max(send_elapsed, ack_elapsed);
 
-        // Spec §4.1.2.3: discard unreliably short intervals
+        // Discard samples with unreliably short intervals.
+        // Spec §4.1.2.3: interval must be >= min_rtt to be reliable.
+        // Before any RTT sample, use 1ms floor to avoid degenerate rates.
         const min_rtt_val = self.getMinRtt();
-        if (min_rtt_val > 0 and interval < min_rtt_val) {
+        const min_interval: i64 = if (min_rtt_val > 0) min_rtt_val else std.time.ns_per_ms;
+        if (interval < min_interval) {
             return .{
                 .rtt_ns = pkt.rtt_ns,
                 .delivered = delivered_delta,
@@ -726,7 +728,10 @@ pub const Bbr = struct {
             @intCast(now - self.extra_acked_interval_start)
         else
             0;
-        var expected_delivered = self.bw * interval_ns / ns_per_s;
+        // u128 intermediate: interval_ns can span seconds, so bw * interval_ns
+        // can exceed u64 at realistic bandwidths (e.g., 1 GB/s * 10s = 1e19).
+        // This matches tquic: (self.bw as u128).saturating_mul(interval.as_micros())
+        var expected_delivered: u64 = @intCast(@as(u128, self.bw) * interval_ns / ns_per_s);
 
         // Reset interval if ACK rate is below expected rate (spec §5.5.9)
         if (self.extra_acked_delivered <= expected_delivered) {
