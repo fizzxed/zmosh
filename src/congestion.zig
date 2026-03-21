@@ -1271,9 +1271,10 @@ pub const Bbr = struct {
     }
 
     fn setPacingRateWithGain(self: *Bbr, gain: u32) void {
-        const rate = self.bw * @as(u64, gain) / 256 * (100 - pacing_margin_percent) / 100;
-        if (self.full_bw_reached or rate > self.pacing_rate) {
-            self.pacing_rate = rate;
+        const rate = @as(u128, self.bw) * gain / 256 * (100 - pacing_margin_percent) / 100;
+        const clamped: u64 = @intCast(@min(rate, max_u64));
+        if (self.full_bw_reached or clamped > self.pacing_rate) {
+            self.pacing_rate = clamped;
         }
     }
 

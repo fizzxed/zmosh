@@ -830,6 +830,14 @@ pub const Gateway = struct {
 
 /// Entry point for `zmx serve <session>`.
 pub fn serveMain(alloc: std.mem.Allocator, session_name: []const u8) !void {
+    // Redirect stderr to a file so panic traces are captured even after
+    // stdout is closed and SSH has disconnected.
+    const panic_log = std.fs.createFileAbsolute("/tmp/zmosh-panic.log", .{ .truncate = true }) catch null;
+    if (panic_log) |f| {
+        posix.dup2(f.handle, posix.STDERR_FILENO) catch {};
+        f.close();
+    }
+
     var gw = try Gateway.init(alloc, session_name, .{});
     defer gw.deinit();
     try gw.run();
