@@ -411,42 +411,41 @@ pub const Gateway = struct {
             self.pacer.onIdleRestart();
         }
 
+        // Priority 1: retransmissions bypass cwnd/pacer — PTO probes MUST be
+        // sent regardless of congestion state (RFC 9002 §6.2.4).
+        while (self.retransmit_queue.items.len > 0) {
+            const rtx_offset = self.retransmit_queue.orderedRemove(0);
+            const entry = self.send_buf.getForRetransmit(rtx_offset) orelse continue;
+            const rtx_payload = self.send_buf.getPayload(rtx_offset) orelse continue;
+
+            var pkt_buf: [1200]u8 = undefined;
+            const pkt = try transport.buildUnreliable(
+                .output,
+                rtx_offset,
+                self.reliable_recv.ack(),
+                self.reliable_recv.ackBits(),
+                rtx_payload,
+                &pkt_buf,
+            );
+
+            self.peer.send(&self.udp_sock, pkt) catch |err| {
+                if (err == error.WouldBlock) {
+                    self.retransmit_queue.insertBounded(0, rtx_offset) catch {};
+                    break;
+                }
+                if (err == error.NoPeerAddress) break;
+                return err;
+            };
+
+            entry.retransmit_count +|= 1;
+            entry.sent_time = now;
+            self.bbr.inflight +|= @as(u32, @intCast(rtx_payload.len));
+            self.pacer.onSend(now, @intCast(rtx_payload.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
+        }
+
+        // New data (subject to cwnd, pacer, and flow control)
         while (self.bbr.canSend() and self.pacer.canSend(now)) {
-            // Priority 1: retransmissions
-            if (self.retransmit_queue.items.len > 0) {
-                const offset = self.retransmit_queue.orderedRemove(0);
-                const entry = self.send_buf.getForRetransmit(offset) orelse continue;
-                const payload = self.send_buf.getPayload(offset) orelse continue;
-
-                var pkt_buf: [1200]u8 = undefined;
-                const pkt = try transport.buildUnreliable(
-                    .output,
-                    offset,
-                    self.reliable_recv.ack(),
-                    self.reliable_recv.ackBits(),
-                    payload,
-                    &pkt_buf,
-                );
-
-                self.peer.send(&self.udp_sock, pkt) catch |err| {
-                    if (err == error.WouldBlock) {
-                        // Put it back
-                        self.retransmit_queue.insertBounded(0, offset) catch {};
-                        return;
-                    }
-                    if (err == error.NoPeerAddress) return;
-                    return err;
-                };
-
-                entry.retransmit_count +|= 1;
-                entry.sent_time = now;
-                // Re-increment inflight: onLoss decremented it, retransmit puts it back
-                self.bbr.inflight +|= @as(u32, @intCast(payload.len));
-                self.pacer.onSend(now, @intCast(payload.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
-                continue;
-            }
-
-            // Priority 2: new data from pending_output
+            // New data from pending_output
             if (self.pending_output.items.len == 0) break;
 
             // Flow control: stop if output_offset has reached client's window limit.
