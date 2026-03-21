@@ -155,9 +155,11 @@ pub const OutputRecvState = struct {
             return .delivered;
         }
 
-        // Duplicate: offset is behind next_offset and within window
-        if (self.next_offset -% offset <= @as(u32, window_size) * step and self.next_offset -% offset > 0) {
-            return .duplicate;
+        // Offset is behind next_offset (duplicate or stale retransmit).
+        // Use wrapping-aware comparison: diff > 0 and < 0x80000000 means behind.
+        const behind_diff = self.next_offset -% offset;
+        if (behind_diff > 0 and behind_diff < 0x80000000) {
+            return if (behind_diff <= @as(u32, window_size) * step) .duplicate else .stale;
         }
 
         // offset > next_offset: out-of-order
@@ -436,6 +438,21 @@ test "output true gap beyond window" {
     try std.testing.expect(out.onPacket(0, "a") == .delivered);
     // Offset 300*1100 is 299 slots away from next_offset=1100, which is >= window_size (256)
     try std.testing.expect(out.onPacket(300 * 1100, "z") == .gap_resync);
+}
+
+test "output old retransmit beyond window is stale, not gap_resync" {
+    var out = OutputRecvState{};
+    // Advance to offset 400*1100 = 440000
+    for (0..400) |i| {
+        const offset: u32 = @intCast(i * max_payload_len);
+        try std.testing.expect(out.onPacket(offset, "x") == .delivered);
+    }
+    // next_offset = 400*1100 = 440000
+    // Old retransmit at offset 100*1100 = 110000 (330 slots behind, > window)
+    // This should be .stale, NOT .gap_resync
+    try std.testing.expect(out.onPacket(100 * 1100, "old") == .stale);
+    // Verify next_offset wasn't reset
+    try std.testing.expectEqual(@as(u32, 440000), out.next_offset);
 }
 
 test "output duplicate detection with reorder buffer" {
