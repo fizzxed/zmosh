@@ -1199,8 +1199,8 @@ pub const Bbr = struct {
 
     fn bdpMultiple(self: *const Bbr, gain: u32) u64 {
         if (self.min_rtt == max_i64) return @as(u64, initial_cwnd);
-        const bdp_val: u64 = @intCast(@min(@as(u128, self.bw) * @as(u128, @intCast(self.min_rtt)) / ns_per_s, max_u64));
-        return bdp_val * @as(u64, gain) / 256;
+        const bdp_val: u128 = @as(u128, self.bw) * @as(u128, @intCast(self.min_rtt)) / ns_per_s;
+        return @intCast(@min(bdp_val * gain / 256, max_u64));
     }
 
     // NOTE: BBRSetSendQuantum (spec §5.6.3) is intentionally not implemented.
