@@ -202,7 +202,9 @@ pub const Bbr = struct {
     extra_acked: u64 = 0,
 
     // --- Pacing + window ---
-    pacing_rate: u64 = 0,
+    // BBRInitPacingRate: initial_cwnd / 1ms * StartupPacingGain
+    // = 12000 / 0.001 * (709/256) = 12,000,000 * 2.77 ≈ 33,234,375
+    pacing_rate: u64 = @as(u64, initial_cwnd) * ns_per_s / std.time.ns_per_ms * startup_pacing_gain / 256,
     cwnd: u32 = initial_cwnd,
     inflight: u32 = 0,
 
@@ -411,6 +413,17 @@ pub const Bbr = struct {
         const ds = pkt.delivery_state;
         const delivered_delta = self.delivered - ds.delivered;
         if (delivered_delta == 0) return .{};
+
+        // Skip bogus samples: if delivered_time or first_sent_time was 0
+        // at send time, the elapsed calculation would use time-since-epoch
+        // producing near-zero delivery rate.
+        if (ds.delivered_time == 0 or ds.first_sent_time == 0) {
+            return .{
+                .rtt_ns = pkt.rtt_ns,
+                .delivered = delivered_delta,
+                .tx_in_flight = ds.tx_in_flight,
+            };
+        }
 
         const send_elapsed = pkt.sent_time - ds.first_sent_time;
         const ack_elapsed = now - ds.delivered_time;
