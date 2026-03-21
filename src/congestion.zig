@@ -483,7 +483,7 @@ pub const Bbr = struct {
     pub fn bdp(self: *const Bbr) u64 {
         const mrtt = self.getMinRtt();
         if (mrtt <= 0 or self.bw == 0) return @as(u64, initial_cwnd);
-        return self.bw * @as(u64, @intCast(mrtt)) / ns_per_s;
+        return self.bw *| @as(u64, @intCast(mrtt)) / ns_per_s;
     }
 
     pub fn getMinRtt(self: *const Bbr) i64 {
@@ -674,7 +674,7 @@ pub const Bbr = struct {
             @intCast(now - self.extra_acked_interval_start)
         else
             0;
-        var expected_delivered = self.bw * interval_ns / ns_per_s;
+        var expected_delivered = self.bw *| interval_ns / ns_per_s;
 
         // Reset interval if ACK rate is below expected rate (spec §5.5.9)
         if (self.extra_acked_delivered <= expected_delivered) {
@@ -1122,7 +1122,7 @@ pub const Bbr = struct {
 
     fn bdpMultiple(self: *const Bbr, gain: u32) u64 {
         if (self.min_rtt == max_i64) return @as(u64, initial_cwnd);
-        const bdp_val = self.bw * @as(u64, @intCast(self.min_rtt)) / ns_per_s;
+        const bdp_val = self.bw *| @as(u64, @intCast(self.min_rtt)) / ns_per_s;
         return bdp_val * @as(u64, gain) / 256;
     }
 
@@ -1298,15 +1298,15 @@ pub const Pacer = struct {
     }
 
     /// BBRSetSendQuantum (spec §5.6.3):
-    ///   send_quantum = clamp(floor(0.02 * pacing_rate), 2*SMSS, 64KB)
-    /// The 2% factor gives ~20ms of data at the current rate, amortizing
-    /// per-packet overhead for sub-millisecond pacing intervals.
+    ///   C.send_quantum = C.pacing_rate * 1ms
+    ///   C.send_quantum = min(C.send_quantum, 64 KBytes)
+    ///   C.send_quantum = max(C.send_quantum, 2 * C.SMSS)
     fn sendQuantum(pacing_rate: u64) u32 {
         const floor = 2 * max_datagram_size; // 2 SMSS
-        const ceil = 65535; // spec cap
+        const ceil = 65535; // 64 KBytes
         if (pacing_rate == 0) return floor;
-        // 2% of pacing_rate (bytes/sec) = pacing_rate / 50
-        const dynamic: u64 = pacing_rate / 50;
+        // pacing_rate (bytes/sec) * 1ms = pacing_rate / 1000
+        const dynamic: u64 = pacing_rate / 1000;
         return @intCast(@min(ceil, @max(floor, dynamic)));
     }
 
