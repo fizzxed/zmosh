@@ -440,7 +440,7 @@ pub const Bbr = struct {
         return .{
             .delivery_rate = rate,
             .rtt_ns = pkt.rtt_ns,
-            .is_app_limited = ds.is_app_limited and self.delivered <= self.app_limited_seq,
+            .is_app_limited = ds.is_app_limited,
             .delivered = delivered_delta,
             .tx_in_flight = ds.tx_in_flight,
         };
