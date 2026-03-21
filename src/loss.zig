@@ -59,28 +59,30 @@ pub const AckRanges = struct {
         };
     }
 
-    /// Iterate all ACKed sequence numbers and call callback(seq) for each.
+    /// Iterate all ACKed offsets and call callback(offset) for each.
+    /// Offsets step by max_payload_len (1 slot = 1 packet).
     pub fn iterateAcked(self: *const AckRanges, callback: anytype) void {
-        // First range: [largest - first_range, largest]
-        var seq = self.largest_acked;
+        // First range: [largest - first_range*step, largest]
+        var offset = self.largest_acked;
         var i: u32 = 0;
         while (i <= self.first_range) : (i += 1) {
-            callback.call(seq);
-            if (seq == 0) return;
-            seq -%= 1;
+            callback.call(offset);
+            if (offset < transport.step) return;
+            offset -%= transport.step;
         }
 
         // Additional ranges
         for (self.gaps) |g| {
-            // Skip gap
-            if (seq < g.gap) return;
-            seq -%= g.gap;
+            // Skip gap (each unit = 1 slot = max_payload_len bytes)
+            const gap_bytes = @as(u32, g.gap) *% transport.step;
+            if (offset < gap_bytes) return;
+            offset -%= gap_bytes;
             // Ack range
             var j: u32 = 0;
             while (j <= g.range) : (j += 1) {
-                callback.call(seq);
-                if (seq == 0) return;
-                seq -%= 1;
+                callback.call(offset);
+                if (offset < transport.step) return;
+                offset -%= transport.step;
             }
         }
     }
@@ -94,20 +96,20 @@ pub const SendBuffer = struct {
     pub const capacity = 2048;
 
     const Entry = struct {
-        seq: u32 = 0,
+        offset: u32 = 0,
         sent_time: i64 = 0,
         size: u32 = 0,
         acked: bool = false,
         retransmit_count: u8 = 0,
         in_use: bool = false,
         delivery_state: congestion.DeliveryState = .{},
-        data: [transport.max_payload_len]u8 = undefined,
+        data: [transport.step]u8 = undefined,
         data_len: u16 = 0,
     };
 
     entries: []Entry,
-    head_seq: u32 = 1,
-    tail_seq: u32 = 1,
+    head_offset: u32 = 0,
+    tail_offset: u32 = 0,
 
     pub fn init(alloc: std.mem.Allocator) !SendBuffer {
         const entries = try alloc.alloc(Entry, capacity);
@@ -119,20 +121,20 @@ pub const SendBuffer = struct {
         alloc.free(self.entries);
     }
 
-    fn idx(seq: u32) usize {
-        return seq % capacity;
+    pub fn idx(offset: u32) usize {
+        return (offset / transport.step) % capacity;
     }
 
     pub fn recordSend(
         self: *SendBuffer,
-        seq: u32,
+        offset: u32,
         payload: []const u8,
         now: i64,
         ds: congestion.DeliveryState,
     ) void {
-        const i = idx(seq);
+        const i = idx(offset);
         self.entries[i] = .{
-            .seq = seq,
+            .offset = offset,
             .sent_time = now,
             .size = @intCast(payload.len),
             .acked = false,
@@ -142,64 +144,64 @@ pub const SendBuffer = struct {
             .data_len = @intCast(payload.len),
         };
         @memcpy(self.entries[i].data[0..payload.len], payload);
-        self.tail_seq = seq +% 1;
+        self.tail_offset = offset +% transport.step;
     }
 
-    pub fn markAcked(self: *SendBuffer, seq: u32) ?*const Entry {
-        const i = idx(seq);
+    pub fn markAcked(self: *SendBuffer, offset: u32) ?*const Entry {
+        const i = idx(offset);
         const entry = &self.entries[i];
-        if (!entry.in_use or entry.seq != seq or entry.acked) return null;
+        if (!entry.in_use or entry.offset != offset or entry.acked) return null;
         entry.acked = true;
         return entry;
     }
 
-    pub fn getForRetransmit(self: *SendBuffer, seq: u32) ?*Entry {
-        const i = idx(seq);
+    pub fn getForRetransmit(self: *SendBuffer, offset: u32) ?*Entry {
+        const i = idx(offset);
         const entry = &self.entries[i];
-        if (!entry.in_use or entry.seq != seq or entry.acked) return null;
+        if (!entry.in_use or entry.offset != offset or entry.acked) return null;
         return entry;
     }
 
-    pub fn getPayload(self: *const SendBuffer, seq: u32) ?[]const u8 {
-        const i = idx(seq);
+    pub fn getPayload(self: *const SendBuffer, offset: u32) ?[]const u8 {
+        const i = idx(offset);
         const entry = &self.entries[i];
-        if (!entry.in_use or entry.seq != seq) return null;
+        if (!entry.in_use or entry.offset != offset) return null;
         return entry.data[0..entry.data_len];
     }
 
     /// Find the oldest unACKed packet's sent_time. Returns null if none.
     pub fn oldestUnackedSentTime(self: *const SendBuffer) ?i64 {
-        var seq = self.head_seq;
-        while (seq != self.tail_seq) : (seq +%= 1) {
-            const i = idx(seq);
+        var offset = self.head_offset;
+        while (offset != self.tail_offset) : (offset +%= transport.step) {
+            const i = idx(offset);
             const entry = &self.entries[i];
-            if (entry.in_use and !entry.acked and entry.seq == seq) {
+            if (entry.in_use and !entry.acked and entry.offset == offset) {
                 return entry.sent_time;
             }
         }
         return null;
     }
 
-    /// Find the oldest unACKed packet's seq. Returns null if none.
-    pub fn oldestUnackedSeq(self: *const SendBuffer) ?u32 {
-        var seq = self.head_seq;
-        while (seq != self.tail_seq) : (seq +%= 1) {
-            const i = idx(seq);
+    /// Find the oldest unACKed packet's offset. Returns null if none.
+    pub fn oldestUnackedOffset(self: *const SendBuffer) ?u32 {
+        var offset = self.head_offset;
+        while (offset != self.tail_offset) : (offset +%= transport.step) {
+            const i = idx(offset);
             const entry = &self.entries[i];
-            if (entry.in_use and !entry.acked and entry.seq == seq) {
-                return seq;
+            if (entry.in_use and !entry.acked and entry.offset == offset) {
+                return offset;
             }
         }
         return null;
     }
 
     pub fn pruneAcked(self: *SendBuffer) void {
-        while (self.head_seq != self.tail_seq) {
-            const i = idx(self.head_seq);
+        while (self.head_offset != self.tail_offset) {
+            const i = idx(self.head_offset);
             const entry = &self.entries[i];
             if (!entry.in_use or !entry.acked) break;
             entry.in_use = false;
-            self.head_seq +%= 1;
+            self.head_offset +%= transport.step;
         }
     }
 };
@@ -261,24 +263,24 @@ pub const LossDetector = struct {
         );
         var earliest_loss_time: i64 = 0;
 
-        var seq = send_buf.head_seq;
-        while (seq != send_buf.tail_seq) : (seq +%= 1) {
-            const i = SendBuffer.idx(seq);
+        var offset = send_buf.head_offset;
+        while (offset != send_buf.tail_offset) : (offset +%= transport.step) {
+            const i = SendBuffer.idx(offset);
             const entry = &send_buf.entries[i];
-            if (!entry.in_use or entry.acked or entry.seq != seq) continue;
+            if (!entry.in_use or entry.acked or entry.offset != offset) continue;
 
-            // Packet threshold: lost if 3 later packets ACKed
-            if (self.largest_acked -% seq >= packet_threshold) {
-                if (!isInQueue(retransmit_list, seq)) {
-                    retransmit_list.appendBounded(seq) catch continue;
+            // Packet threshold: lost if 3 later packets ACKed (in slots)
+            if ((self.largest_acked -% offset) / transport.step >= packet_threshold) {
+                if (!isInQueue(retransmit_list, offset)) {
+                    retransmit_list.appendBounded(offset) catch continue;
                 }
                 continue;
             }
 
             // Time threshold
             if (now - entry.sent_time >= loss_delay) {
-                if (!isInQueue(retransmit_list, seq)) {
-                    retransmit_list.appendBounded(seq) catch continue;
+                if (!isInQueue(retransmit_list, offset)) {
+                    retransmit_list.appendBounded(offset) catch continue;
                 }
             } else {
                 // Track earliest time this packet would become lost
@@ -306,9 +308,9 @@ pub const LossDetector = struct {
         return base *| (@as(i64, 1) << shift);
     }
 
-    fn isInQueue(list: *const std.ArrayListUnmanaged(u32), seq: u32) bool {
+    fn isInQueue(list: *const std.ArrayListUnmanaged(u32), offset: u32) bool {
         for (list.items) |s| {
-            if (s == seq) return true;
+            if (s == offset) return true;
         }
         return false;
     }
@@ -327,28 +329,28 @@ fn seqGt(a: u32, b: u32) bool {
 pub const OutputAckTracker = struct {
     largest_recv: u32 = 0,
     has_received: bool = false,
-    // 512-bit bitmap: tracks which of the 512 seqs before largest_recv were received
+    // 512-bit bitmap: tracks which of the 512 slots before largest_recv were received
     bitmap: [16]u32 = [1]u32{0} ** 16,
 
-    pub fn onRecv(self: *OutputAckTracker, seq: u32) void {
+    pub fn onRecv(self: *OutputAckTracker, offset: u32) void {
         if (!self.has_received) {
-            self.largest_recv = seq;
+            self.largest_recv = offset;
             self.has_received = true;
             @memset(&self.bitmap, 0);
             return;
         }
 
-        if (seqGt(seq, self.largest_recv)) {
-            // New highest seq — shift bitmap
-            const shift = seq -% self.largest_recv;
+        if (seqGt(offset, self.largest_recv)) {
+            // New highest offset — shift bitmap by slot count
+            const shift = (offset -% self.largest_recv) / transport.step;
             self.shiftBitmap(shift);
-            self.largest_recv = seq;
-        } else if (seq == self.largest_recv) {
+            self.largest_recv = offset;
+        } else if (offset == self.largest_recv) {
             // Duplicate of largest — already tracked
             return;
         } else {
-            // Old seq — set bit in bitmap
-            const diff = self.largest_recv -% seq;
+            // Old offset — set bit in bitmap
+            const diff = (self.largest_recv -% offset) / transport.step;
             if (diff > 0 and diff <= 512) {
                 self.setBit(diff - 1);
             }
@@ -360,7 +362,7 @@ pub const OutputAckTracker = struct {
             return .{ .largest_acked = 0, .first_range = 0, .gaps = &[0]AckRanges.Gap{} };
         }
 
-        // Count consecutive acked from largest going backward
+        // Count consecutive acked from largest going backward (in slots)
         var first_range: u16 = 0;
         var pos: u32 = 1;
         while (pos <= 512) : (pos += 1) {
@@ -368,19 +370,19 @@ pub const OutputAckTracker = struct {
             first_range += 1;
         }
 
-        // Find gap-range pairs
+        // Find gap-range pairs (units are slots)
         var num_gaps: usize = 0;
         const max_gaps = @min(gap_storage.len, AckRanges.max_gaps);
 
         while (pos <= 512 and num_gaps < max_gaps) {
-            // Count gap (unacked)
+            // Count gap (unacked slots)
             var gap_count: u16 = 0;
             while (pos <= 512 and !self.hasBit(pos - 1)) : (pos += 1) {
                 gap_count += 1;
             }
             if (gap_count == 0 or pos > 512) break;
 
-            // Count range (acked)
+            // Count range (acked slots)
             var range_count: u16 = 0;
             while (pos <= 512 and self.hasBit(pos - 1)) : (pos += 1) {
                 range_count += 1;
@@ -493,12 +495,13 @@ test "AckRanges empty decode" {
     try std.testing.expectEqual(@as(usize, 0), decoded.gaps.len);
 }
 
-test "AckRanges iterate acked sequences" {
+test "AckRanges iterate acked offsets" {
+    const step = transport.step;
     const gaps = [_]AckRanges.Gap{
         .{ .gap = 2, .range = 1 },
     };
     const ranges = AckRanges{
-        .largest_acked = 10,
+        .largest_acked = 10 * step,
         .first_range = 2,
         .gaps = &gaps,
     };
@@ -510,9 +513,9 @@ test "AckRanges iterate acked sequences" {
         acked_buf: *[32]u32,
         count_ptr: *usize,
 
-        pub fn call(self: @This(), seq: u32) void {
+        pub fn call(self: @This(), offset: u32) void {
             if (self.count_ptr.* < 32) {
-                self.acked_buf[self.count_ptr.*] = seq;
+                self.acked_buf[self.count_ptr.*] = offset;
                 self.count_ptr.* += 1;
             }
         }
@@ -523,70 +526,77 @@ test "AckRanges iterate acked sequences" {
         .count_ptr = &count,
     });
 
-    // Expected: 10, 9, 8 (first_range=2) + gap=2 (skip 7,6) + range=1 → 5, 4
+    // Expected: 10*s, 9*s, 8*s (first_range=2) + gap=2 (skip 7*s,6*s) + range=1 → 5*s, 4*s
     try std.testing.expectEqual(@as(usize, 5), count);
-    try std.testing.expectEqual(@as(u32, 10), acked[0]);
-    try std.testing.expectEqual(@as(u32, 9), acked[1]);
-    try std.testing.expectEqual(@as(u32, 8), acked[2]);
-    try std.testing.expectEqual(@as(u32, 5), acked[3]);
-    try std.testing.expectEqual(@as(u32, 4), acked[4]);
+    try std.testing.expectEqual(@as(u32, 10 * step), acked[0]);
+    try std.testing.expectEqual(@as(u32, 9 * step), acked[1]);
+    try std.testing.expectEqual(@as(u32, 8 * step), acked[2]);
+    try std.testing.expectEqual(@as(u32, 5 * step), acked[3]);
+    try std.testing.expectEqual(@as(u32, 4 * step), acked[4]);
 }
 
 test "SendBuffer record and ack" {
+    const step = transport.step;
     var buf = try SendBuffer.init(std.testing.allocator);
     defer buf.deinit(std.testing.allocator);
 
     const payload = "hello";
-    buf.recordSend(1, payload, 1000, .{});
-    buf.recordSend(2, payload, 2000, .{});
+    buf.recordSend(0, payload, 1000, .{});
+    buf.recordSend(step, payload, 2000, .{});
 
-    // Mark seq 1 acked
-    const entry = buf.markAcked(1);
+    // Mark offset 0 acked
+    const entry = buf.markAcked(0);
     try std.testing.expect(entry != null);
     try std.testing.expect(entry.?.acked);
 
     // Duplicate ack returns null
-    try std.testing.expect(buf.markAcked(1) == null);
+    try std.testing.expect(buf.markAcked(0) == null);
 
-    // Prune: seq 1 is acked, head advances
+    // Prune: offset 0 is acked, head advances
     buf.pruneAcked();
-    try std.testing.expectEqual(@as(u32, 2), buf.head_seq);
+    try std.testing.expectEqual(@as(u32, step), buf.head_offset);
 }
 
 test "SendBuffer get payload" {
+    const step = transport.step;
     var buf = try SendBuffer.init(std.testing.allocator);
     defer buf.deinit(std.testing.allocator);
 
-    buf.recordSend(5, "test data", 1000, .{});
-    const payload = buf.getPayload(5);
+    buf.recordSend(5 * step, "test data", 1000, .{});
+    const payload = buf.getPayload(5 * step);
     try std.testing.expect(payload != null);
     try std.testing.expectEqualStrings("test data", payload.?);
 
-    // Non-existent seq
-    try std.testing.expect(buf.getPayload(99) == null);
+    // Non-existent offset
+    try std.testing.expect(buf.getPayload(99 * step) == null);
 }
 
 test "LossDetector packet threshold" {
+    const step = transport.step;
     var det = LossDetector{};
     var send_buf = try SendBuffer.init(std.testing.allocator);
     defer send_buf.deinit(std.testing.allocator);
 
-    // Record sends for seq 1..6
-    for (1..7) |i| {
-        send_buf.recordSend(@intCast(i), "x", @intCast(i * 1000), .{});
+    // Record sends for offsets 0..5*step
+    for (0..6) |i| {
+        const offset: u32 = @intCast(i * step);
+        send_buf.recordSend(offset, "x", @intCast((i + 1) * 1000), .{});
     }
 
-    // ACK seq 4
-    _ = send_buf.markAcked(4);
-    det.onAck(4);
+    // ACK offset 4*step (slot 4 is 4 slots ahead of slot 0)
+    _ = send_buf.markAcked(4 * step);
+    det.onAck(4 * step);
 
     var lost_buf: [64]u32 = undefined;
     var lost = std.ArrayListUnmanaged(u32).initBuffer(&lost_buf);
     _ = det.detectLosses(&send_buf, 100000, 50_000_000, 50_000_000, &lost);
 
-    // Seq 1 is lost (4 - 1 = 3 >= threshold)
-    try std.testing.expectEqual(@as(usize, 1), lost.items.len);
-    try std.testing.expectEqual(@as(u32, 1), lost.items[0]);
+    // Offset 0 is lost (4 slots >= 3 threshold), offset 1*step is also lost (3 slots >= 3)
+    // But slot 0: (4*step - 0) / step = 4 >= 3 → lost
+    // Slot 1: (4*step - step) / step = 3 >= 3 → lost
+    try std.testing.expectEqual(@as(usize, 2), lost.items.len);
+    try std.testing.expectEqual(@as(u32, 0), lost.items[0]);
+    try std.testing.expectEqual(@as(u32, step), lost.items[1]);
 }
 
 test "LossDetector PTO computation" {
@@ -605,55 +615,59 @@ test "LossDetector PTO computation" {
 }
 
 test "OutputAckTracker sequential" {
+    const step = transport.step;
     var tracker = OutputAckTracker{};
 
-    // Receive seq 1, 2, 3 in order
-    tracker.onRecv(1);
-    tracker.onRecv(2);
-    tracker.onRecv(3);
+    // Receive offsets 0, 1100, 2200 in order
+    tracker.onRecv(0);
+    tracker.onRecv(step);
+    tracker.onRecv(2 * step);
 
     var gap_buf: [16]AckRanges.Gap = undefined;
     const ranges = tracker.generateAckRanges(&gap_buf);
-    try std.testing.expectEqual(@as(u32, 3), ranges.largest_acked);
-    try std.testing.expectEqual(@as(u16, 2), ranges.first_range); // 3, 2, 1 consecutive
+    try std.testing.expectEqual(@as(u32, 2 * step), ranges.largest_acked);
+    try std.testing.expectEqual(@as(u16, 2), ranges.first_range); // 3 consecutive slots
     try std.testing.expectEqual(@as(usize, 0), ranges.gaps.len);
 }
 
 test "OutputAckTracker with gap" {
+    const step = transport.step;
     var tracker = OutputAckTracker{};
 
-    // Receive 1, 2, 3, then skip 4, receive 5
-    tracker.onRecv(1);
-    tracker.onRecv(2);
-    tracker.onRecv(3);
-    tracker.onRecv(5); // gap at 4
+    // Receive offsets 0, 1100, 2200, then skip 3300, receive 4400
+    tracker.onRecv(0);
+    tracker.onRecv(step);
+    tracker.onRecv(2 * step);
+    tracker.onRecv(4 * step); // gap at 3*step
 
     var gap_buf: [16]AckRanges.Gap = undefined;
     const ranges = tracker.generateAckRanges(&gap_buf);
-    try std.testing.expectEqual(@as(u32, 5), ranges.largest_acked);
-    try std.testing.expectEqual(@as(u16, 0), ranges.first_range); // only 5 is consecutive
-    try std.testing.expectEqual(@as(usize, 1), ranges.gaps.len); // gap=1 (seq 4), range for 1,2,3
+    try std.testing.expectEqual(@as(u32, 4 * step), ranges.largest_acked);
+    try std.testing.expectEqual(@as(u16, 0), ranges.first_range); // only 4*step is consecutive
+    try std.testing.expectEqual(@as(usize, 1), ranges.gaps.len); // gap=1 (slot 3), range for 0,1,2
 }
 
 test "OutputAckTracker out of order" {
+    const step = transport.step;
     var tracker = OutputAckTracker{};
 
-    tracker.onRecv(1);
-    tracker.onRecv(3); // skip 2
-    tracker.onRecv(2); // fill gap
+    tracker.onRecv(0);
+    tracker.onRecv(2 * step); // skip step
+    tracker.onRecv(step); // fill gap
 
     var gap_buf: [16]AckRanges.Gap = undefined;
     const ranges = tracker.generateAckRanges(&gap_buf);
-    try std.testing.expectEqual(@as(u32, 3), ranges.largest_acked);
-    try std.testing.expectEqual(@as(u16, 2), ranges.first_range); // 3, 2, 1 all present
+    try std.testing.expectEqual(@as(u32, 2 * step), ranges.largest_acked);
+    try std.testing.expectEqual(@as(u16, 2), ranges.first_range); // all 3 present
     try std.testing.expectEqual(@as(usize, 0), ranges.gaps.len);
 }
 
 test "OutputAckTracker encode roundtrip" {
+    const step = transport.step;
     var tracker = OutputAckTracker{};
-    for (1..20) |i| {
+    for (0..19) |i| {
         if (i != 5 and i != 10) {
-            tracker.onRecv(@intCast(i));
+            tracker.onRecv(@as(u32, @intCast(i)) * step);
         }
     }
 

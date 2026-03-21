@@ -1,7 +1,9 @@
 const std = @import("std");
+const transport = @import("transport.zig");
 
 /// Nanoseconds per second.
 const ns_per_s: u64 = std.time.ns_per_s;
+const max_payload_len: u32 = transport.max_payload_len;
 
 // ---------------------------------------------------------------------------
 // Constants (BBR v3, draft-ietf-ccwg-bbr-05)
@@ -258,8 +260,8 @@ pub const Bbr = struct {
     // --- Startup high-loss tracking ---
     startup_loss_events: u32 = 0, // discontiguous loss events in current round
     bytes_lost_in_round: u64 = 0, // bytes lost in current round
-    last_startup_lost_seq: u32 = 0, // last lost seq for discontiguous tracking
-    has_last_startup_lost: bool = false, // whether last_startup_lost_seq is valid
+    last_startup_lost_offset: u32 = 0, // last lost offset for discontiguous tracking
+    has_last_startup_lost: bool = false, // whether last_startup_lost_offset is valid
 
     // --- Loss recovery state ---
     in_loss_recovery: bool = false, // set by onSevereLoss, cleared by restoreCwnd
@@ -407,12 +409,12 @@ pub const Bbr = struct {
     }
 
     /// Per-loss handler: BBRHandleLostPacket (spec 5.5.10.2)
-    /// lost_seq: sequence number of the lost packet
+    /// lost_offset: byte offset of the lost packet
     /// pkt_size: size of the lost packet
     /// lost: cumulative data lost since this packet was sent (RS.lost)
     /// tx_in_flight: C.inflight when this packet was sent (RS.tx_in_flight)
     /// is_app_limited_at_send: P.is_app_limited
-    pub fn onLoss(self: *Bbr, lost_seq: u32, pkt_size: u32, lost: u64, tx_in_flight: u32, is_app_limited: bool) void {
+    pub fn onLoss(self: *Bbr, lost_offset: u32, pkt_size: u32, lost: u64, tx_in_flight: u32, is_app_limited: bool) void {
         self.inflight -|= pkt_size;
         self.total_lost += pkt_size;
         self.bytes_lost_in_round += pkt_size;
@@ -425,12 +427,12 @@ pub const Bbr = struct {
         self.loss_in_round = true;
 
         // Count discontiguous loss events during Startup (for D8 criterion 3).
-        // Two consecutive lost packets (seq N and N+1) are one loss event.
+        // Two consecutive lost packets (offset N and N+max_payload_len) are one loss event.
         if (!self.bw_probe_samples) {
-            if (!self.has_last_startup_lost or lost_seq != self.last_startup_lost_seq +% 1) {
+            if (!self.has_last_startup_lost or lost_offset != self.last_startup_lost_offset +% max_payload_len) {
                 self.startup_loss_events += 1;
             }
-            self.last_startup_lost_seq = lost_seq;
+            self.last_startup_lost_offset = lost_offset;
             self.has_last_startup_lost = true;
             return;
         }

@@ -64,7 +64,7 @@ pub const Gateway = struct {
 
     reliable_send: transport.ReliableSend,
     reliable_recv: transport.RecvState,
-    output_seq: u32,
+    output_offset: u32,
 
     // BBR congestion control + pacing
     bbr: congestion.Bbr,
@@ -171,7 +171,7 @@ pub const Gateway = struct {
             .pending_output = pending_output,
             .reliable_send = reliable_send,
             .reliable_recv = .{},
-            .output_seq = 1,
+            .output_offset = 0,
             .bbr = .{},
             .pacer = .{},
             .send_buf = send_buf,
@@ -371,14 +371,14 @@ pub const Gateway = struct {
         while (self.bbr.canSend() and self.pacer.canSend(now)) {
             // Priority 1: retransmissions
             if (self.retransmit_queue.items.len > 0) {
-                const seq = self.retransmit_queue.orderedRemove(0);
-                const entry = self.send_buf.getForRetransmit(seq) orelse continue;
-                const payload = self.send_buf.getPayload(seq) orelse continue;
+                const offset = self.retransmit_queue.orderedRemove(0);
+                const entry = self.send_buf.getForRetransmit(offset) orelse continue;
+                const payload = self.send_buf.getPayload(offset) orelse continue;
 
                 var pkt_buf: [1200]u8 = undefined;
                 const pkt = try transport.buildUnreliable(
                     .output,
-                    seq,
+                    offset,
                     self.reliable_recv.ack(),
                     self.reliable_recv.ackBits(),
                     payload,
@@ -388,7 +388,7 @@ pub const Gateway = struct {
                 self.peer.send(&self.udp_sock, pkt) catch |err| {
                     if (err == error.WouldBlock) {
                         // Put it back
-                        self.retransmit_queue.insertBounded(0, seq) catch {};
+                        self.retransmit_queue.insertBounded(0, offset) catch {};
                         return;
                     }
                     if (err == error.NoPeerAddress) return;
@@ -408,16 +408,16 @@ pub const Gateway = struct {
 
             const end = @min(transport.max_payload_len, self.pending_output.items.len);
             const chunk = self.pending_output.items[0..end];
-            const seq = self.output_seq;
+            const offset = self.output_offset;
 
             // OnPacketSent: init + snapshot + update inflight (spec §4.1.2.2)
             const ds = self.bbr.onSend(@intCast(chunk.len), now);
-            self.send_buf.recordSend(seq, chunk, now, ds);
+            self.send_buf.recordSend(offset, chunk, now, ds);
 
             var pkt_buf: [1200]u8 = undefined;
             const pkt = try transport.buildUnreliable(
                 .output,
-                seq,
+                offset,
                 self.reliable_recv.ack(),
                 self.reliable_recv.ackBits(),
                 chunk,
@@ -434,7 +434,7 @@ pub const Gateway = struct {
             };
 
             self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate);
-            self.output_seq +%= 1;
+            self.output_offset +%= transport.step;
 
             // Remove sent data from pending buffer
             self.pending_output.replaceRange(self.alloc, 0, end, &[_]u8{}) catch unreachable;
@@ -466,7 +466,7 @@ pub const Gateway = struct {
         // Track whether any packet in the retransmit queue was ACKed (spurious loss)
         var spurious_detected = false;
 
-        // Process ACKed seqs
+        // Process ACKed offsets
         const Ctx = struct {
             gw: *Gateway,
             now_ns: i64,
@@ -476,21 +476,21 @@ pub const Gateway = struct {
         const Handler = struct {
             ctx_inner: Ctx,
 
-            pub fn call(handler: @This(), seq: u32) void {
+            pub fn call(handler: @This(), offset: u32) void {
                 const gw = handler.ctx_inner.gw;
                 const n = handler.ctx_inner.now_ns;
 
-                // Spurious loss detection: if this seq is in the retransmit queue
+                // Spurious loss detection: if this offset is in the retransmit queue
                 // (declared lost) but arrives ACKed, the loss was spurious.
-                for (gw.retransmit_queue.items, 0..) |rseq, idx| {
-                    if (rseq == seq) {
+                for (gw.retransmit_queue.items, 0..) |roffset, idx| {
+                    if (roffset == offset) {
                         _ = gw.retransmit_queue.orderedRemove(idx);
                         handler.ctx_inner.spurious.* = true;
                         break;
                     }
                 }
 
-                const entry = gw.send_buf.markAcked(seq) orelse return;
+                const entry = gw.send_buf.markAcked(offset) orelse return;
 
                 // RTT: Karn's algorithm -- only use non-retransmitted packets.
                 if (entry.retransmit_count == 0) {
@@ -528,11 +528,11 @@ pub const Gateway = struct {
         self.loss_time = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
         // Only notify BBR about NEWLY detected losses (not already-queued ones)
-        for (self.retransmit_queue.items[prev_queue_len..]) |lost_seq| {
-            if (self.send_buf.getForRetransmit(lost_seq)) |entry| {
+        for (self.retransmit_queue.items[prev_queue_len..]) |lost_offset| {
+            if (self.send_buf.getForRetransmit(lost_offset)) |entry| {
                 // RS.lost = C.lost - P.lost (cumulative lost since this packet was sent)
                 const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
-                self.bbr.onLoss(lost_seq, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
+                self.bbr.onLoss(lost_offset, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
             }
         }
 
@@ -588,10 +588,10 @@ pub const Gateway = struct {
         const prev_queue_len = self.retransmit_queue.items.len;
         self.loss_time = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
-        for (self.retransmit_queue.items[prev_queue_len..]) |lost_seq| {
-            if (self.send_buf.getForRetransmit(lost_seq)) |entry| {
+        for (self.retransmit_queue.items[prev_queue_len..]) |lost_offset| {
+            if (self.send_buf.getForRetransmit(lost_offset)) |entry| {
                 const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
-                self.bbr.onLoss(lost_seq, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
+                self.bbr.onLoss(lost_offset, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
             }
         }
 
@@ -601,13 +601,13 @@ pub const Gateway = struct {
     /// RFC 9002 §6.2.4 OnLossDetectionTimeout (PTO mode).
     /// Retransmit the oldest unACKed packet as a probe to elicit ACKs.
     fn onPtoTimeout(self: *Gateway, now: i64) void {
-        const probe_seq = self.send_buf.oldestUnackedSeq() orelse return;
+        const probe_offset = self.send_buf.oldestUnackedOffset() orelse return;
 
         // Queue for retransmission if not already queued
         for (self.retransmit_queue.items) |s| {
-            if (s == probe_seq) break; // already queued
+            if (s == probe_offset) break; // already queued
         } else {
-            self.retransmit_queue.appendBounded(probe_seq) catch {};
+            self.retransmit_queue.appendBounded(probe_offset) catch {};
         }
 
         self.pto_count += 1;
@@ -776,7 +776,7 @@ pub const Gateway = struct {
             .pending_output = pending_output,
             .reliable_send = reliable_send,
             .reliable_recv = .{},
-            .output_seq = 1,
+            .output_offset = 0,
             .bbr = .{},
             .pacer = .{},
             .send_buf = send_buf,
@@ -980,7 +980,7 @@ test "integration: BBR paced output delivery with simulated loss" {
                         output_ack_tracker.onRecv(packet.seq);
                         const deliveries = output_recv.deliverSlice();
                         for (1..deliveries.len()) |di| {
-                            output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)));
+                            output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)) *% transport.step);
                         }
                         for (0..deliveries.len()) |i| {
                             const p = deliveries.get(i);

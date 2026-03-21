@@ -359,7 +359,7 @@ export fn zmosh_poll(session: ?*Session) Status {
                         const deliveries = s.output_recv.deliverSlice();
                         // Track ACKs for buffered packets delivered in batch
                         for (1..deliveries.len()) |di| {
-                            s.output_ack_tracker.onRecv(s.output_recv.deliver_start +% @as(u32, @intCast(di)));
+                            s.output_ack_tracker.onRecv(s.output_recv.deliver_start +% @as(u32, @intCast(di)) *% transport.step);
                         }
                         for (0..deliveries.len()) |i| {
                             const p = deliveries.get(i);

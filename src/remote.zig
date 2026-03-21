@@ -241,7 +241,7 @@ fn sendIpcReliable(
     now: i64,
 ) !void {
     if (payload.len <= max_ipc_payload) {
-        var buf: [transport.max_payload_len]u8 = undefined;
+        var buf: [transport.step]u8 = undefined;
         const ipc_bytes = transport.buildIpcBytes(tag, payload, &buf);
         try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .reliable_ipc, ipc_bytes, now);
         return;
@@ -250,7 +250,7 @@ fn sendIpcReliable(
     var off: usize = 0;
     while (off < payload.len) {
         const end = @min(off + max_ipc_payload, payload.len);
-        var buf: [transport.max_payload_len]u8 = undefined;
+        var buf: [transport.step]u8 = undefined;
         const ipc_bytes = transport.buildIpcBytes(tag, payload[off..end], &buf);
         try sendReliablePayload(peer, sock, reliable_send, reliable_recv, .reliable_ipc, ipc_bytes, now);
         off = end;
@@ -422,13 +422,13 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         if (now - last_stats_dump_ns >= 2 * std.time.ns_per_s) {
             const srtt_ms = if (peer.srtt_us) |s| @divFloor(s, 1000) else @as(i64, -1);
             const since_last_pkt_ms = if (last_output_pkt_ns > 0) @divFloor(now - last_output_pkt_ns, std.time.ns_per_ms) else @as(i64, -1);
-            debugWrite(debug_log, "stats: delivered={d} buffered={d} gap_resync={d} max_reorder={d} stdout_buf={d} expected={d} ack_largest={d} srtt_ms={d} pkts_2s={d} since_last_ms={d} poll_ms={d} ack_dirty={}\n", .{
+            debugWrite(debug_log, "stats: delivered={d} buffered={d} gap_resync={d} max_reorder={d} stdout_buf={d} next_offset={d} ack_largest={d} srtt_ms={d} pkts_2s={d} since_last_ms={d} poll_ms={d} ack_dirty={}\n", .{
                 output_recv.delivered_total,
                 output_recv.buffered_total,
                 output_recv.gap_resync_total,
                 output_recv.max_reorder_dist,
                 stdout_buf.items.len,
-                output_recv.expected,
+                output_recv.next_offset,
                 output_ack_tracker.largest_recv,
                 srtt_ms,
                 output_pkts_this_interval,
@@ -512,7 +512,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                         output_pkts_this_interval += 1;
                         last_output_pkt_ns = now;
                         const action = output_recv.onPacket(packet.seq, packet.payload);
-                        debugWrite(debug_log, "OUT seq={d} len={d} action={s} expected={d}\n", .{
+                        debugWrite(debug_log, "OUT offset={d} len={d} action={s} next_offset={d}\n", .{
                             packet.seq,
                             packet.payload.len,
                             switch (action) {
@@ -522,7 +522,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                 .stale => "stale",
                                 .gap_resync => "gap_resync",
                             },
-                            output_recv.expected,
+                            output_recv.next_offset,
                         });
                         switch (action) {
                             .delivered => {
@@ -532,7 +532,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                 if (deliveries.len() > 1) {
                                     debugWrite(debug_log, "REORDER_RECOVERY count={d}\n", .{deliveries.len()});
                                     for (1..deliveries.len()) |di| {
-                                        output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)));
+                                        output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)) *% transport.step);
                                     }
                                 }
                                 var deliver_bytes: usize = 0;
@@ -555,7 +555,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                 ack_dirty = true;
                             },
                             .gap_resync => {
-                                debugWrite(debug_log, "GAP_RESYNC seq={d} new_expected={d} (window={d})\n", .{ packet.seq, output_recv.expected, transport.OutputRecvState.window_size });
+                                debugWrite(debug_log, "GAP_RESYNC offset={d} new_next_offset={d} (window={d})\n", .{ packet.seq, output_recv.next_offset, transport.OutputRecvState.window_size });
                                 output_ack_tracker = .{};
                                 ack_dirty = true;
                                 stdout_buf.clearRetainingCapacity();
