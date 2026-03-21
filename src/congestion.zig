@@ -112,6 +112,7 @@ pub const RateSample = struct {
     newly_acked: u32 = 0,
     lost: u64 = 0,
     tx_in_flight: u32 = 0,
+    prior_delivered: u64 = 0, // P.delivered: snapshot of C.delivered when packet was sent
 };
 
 // ---------------------------------------------------------------------------
@@ -257,6 +258,8 @@ pub const Bbr = struct {
     // --- Startup high-loss tracking ---
     startup_loss_events: u32 = 0, // discontiguous loss events in current round
     bytes_lost_in_round: u64 = 0, // bytes lost in current round
+    last_startup_lost_seq: u32 = 0, // last lost seq for discontiguous tracking
+    has_last_startup_lost: bool = false, // whether last_startup_lost_seq is valid
 
     // --- Undo state (for spurious loss recovery) ---
     undo_state: BbrState = .startup,
@@ -361,11 +364,12 @@ pub const Bbr = struct {
     }
 
     /// Per-loss handler: BBRHandleLostPacket (spec 5.5.10.2)
+    /// lost_seq: sequence number of the lost packet
     /// pkt_size: size of the lost packet
     /// lost: cumulative data lost since this packet was sent (RS.lost)
     /// tx_in_flight: C.inflight when this packet was sent (RS.tx_in_flight)
     /// is_app_limited_at_send: P.is_app_limited
-    pub fn onLoss(self: *Bbr, pkt_size: u32, lost: u64, tx_in_flight: u32, is_app_limited: bool) void {
+    pub fn onLoss(self: *Bbr, lost_seq: u32, pkt_size: u32, lost: u64, tx_in_flight: u32, is_app_limited: bool) void {
         self.inflight -|= pkt_size;
         self.total_lost += pkt_size;
         self.bytes_lost_in_round += pkt_size;
@@ -377,9 +381,14 @@ pub const Bbr = struct {
         }
         self.loss_in_round = true;
 
-        // Count discontiguous loss events during Startup (for D8 criterion 3)
+        // Count discontiguous loss events during Startup (for D8 criterion 3).
+        // Two consecutive lost packets (seq N and N+1) are one loss event.
         if (!self.bw_probe_samples) {
-            self.startup_loss_events += 1;
+            if (!self.has_last_startup_lost or lost_seq != self.last_startup_lost_seq +% 1) {
+                self.startup_loss_events += 1;
+            }
+            self.last_startup_lost_seq = lost_seq;
+            self.has_last_startup_lost = true;
             return;
         }
 
@@ -444,7 +453,7 @@ pub const Bbr = struct {
     fn computeRateSample(self: *const Bbr, pkt: AckedPacket, now: i64) RateSample {
         const ds = pkt.delivery_state;
         const delivered_delta = self.delivered - ds.delivered;
-        if (delivered_delta == 0) return .{};
+        if (delivered_delta == 0) return .{ .prior_delivered = ds.delivered };
 
         const send_elapsed = pkt.sent_time - ds.first_sent_time;
         const ack_elapsed = now - ds.delivered_time;
@@ -457,7 +466,9 @@ pub const Bbr = struct {
             return .{
                 .rtt_ns = pkt.rtt_ns,
                 .delivered = delivered_delta,
+                .lost = self.total_lost -| ds.lost,
                 .tx_in_flight = ds.tx_in_flight,
+                .prior_delivered = ds.delivered,
             };
         }
 
@@ -468,7 +479,9 @@ pub const Bbr = struct {
             .rtt_ns = pkt.rtt_ns,
             .is_app_limited = ds.is_app_limited,
             .delivered = delivered_delta,
+            .lost = self.total_lost -| ds.lost,
             .tx_in_flight = ds.tx_in_flight,
+            .prior_delivered = ds.delivered,
         };
     }
 
@@ -476,13 +489,10 @@ pub const Bbr = struct {
     // Internal: Round counting (spec 5.5.1)
     // ------------------------------------------------------------------
 
-    fn updateRound(self: *Bbr, rs: RateSample) void {
-        // Use > (not >=) per spec: "packet.delivered >= BBR.next_round_delivered"
-        // The spec uses >= for the comparison. Let's follow exactly:
-        // "if (packet.delivered >= BBR.next_round_delivered)"
-        // Here rs represents the cumulative delivered at the acked packet's send time.
-        // We check C.delivered (which includes this packet) against next_round_delivered.
-        if (self.delivered >= self.next_round_delivered) {
+    fn updateRound(self: *Bbr, pkt_delivered: u64) void {
+        // Spec §5.5.1: "if (packet.delivered >= BBR.next_round_delivered)"
+        // packet.delivered is P.delivered: the snapshot of C.delivered when packet was sent.
+        if (pkt_delivered >= self.next_round_delivered) {
             self.startRound();
             self.round_count += 1;
             self.rounds_since_bw_probe += 1;
@@ -490,7 +500,6 @@ pub const Bbr = struct {
         } else {
             self.round_start = false;
         }
-        _ = rs;
     }
 
     fn startRound(self: *Bbr) void {
@@ -505,7 +514,9 @@ pub const Bbr = struct {
         self.loss_round_start = false;
         self.bw_latest = @max(self.bw_latest, rs.delivery_rate);
         self.inflight_latest = @max(self.inflight_latest, rs.delivered);
-        if (self.delivered >= self.loss_round_delivered) {
+        // Spec line 3672: "if (RS.prior_delivered >= BBR.loss_round_delivered)"
+        // RS.prior_delivered is P.delivered of the most recently delivered packet.
+        if (rs.prior_delivered >= self.loss_round_delivered) {
             self.loss_round_delivered = self.delivered;
             self.loss_round_start = true;
         }
@@ -528,11 +539,12 @@ pub const Bbr = struct {
         self.inflight_latest = 0;
         self.startup_loss_events = 0;
         self.bytes_lost_in_round = 0;
+        self.has_last_startup_lost = false;
     }
 
     fn updateCongestionSignals(self: *Bbr, rs: RateSample, now: i64) void {
         // BBRUpdateMaxBw (spec 5.5.5)
-        self.updateRound(rs);
+        self.updateRound(rs.prior_delivered);
         self.updateMaxBw(rs);
         _ = now;
 
@@ -1312,7 +1324,7 @@ test "Bbr loss response with bw_probe_samples guard" {
     bbr.bw_probe_samples = true;
 
     // Lose 500 out of 10000 in-flight (5% loss rate > 2% threshold)
-    bbr.onLoss(500, 500, 10000, false);
+    bbr.onLoss(10, 500, 500, 10000, false);
     try std.testing.expectEqual(@as(u32, 9500), bbr.inflight);
     // inflight_longterm should be reduced
     try std.testing.expect(bbr.inflight_longterm < max_u32);
@@ -1320,7 +1332,7 @@ test "Bbr loss response with bw_probe_samples guard" {
     // Second loss should not react again (bw_probe_samples was cleared)
     const prev_longterm = bbr.inflight_longterm;
     bbr.bw_probe_samples = false;
-    bbr.onLoss(500, 1000, 10000, false);
+    bbr.onLoss(11, 500, 1000, 10000, false);
     try std.testing.expectEqual(prev_longterm, bbr.inflight_longterm);
 }
 
