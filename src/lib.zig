@@ -93,13 +93,25 @@ fn sendHeartbeat(s: *Session, now: i64) !void {
     else
         "";
 
+    // Append flow control max_offset after ACK ranges.
+    // The C API delivers output immediately via callback (no stdout buffer),
+    // so recv_window is capped only by the reorder window.
+    const reorder_cap = @as(usize, transport.OutputRecvState.window_size) * @as(usize, transport.step);
+    const recv_window: u32 = @intCast(@min(reorder_cap, std.math.maxInt(u32)));
+    const max_offset = s.output_recv.next_offset +% recv_window;
+
+    var hb_payload_buf: [256]u8 = undefined;
+    @memcpy(hb_payload_buf[0..ack_payload.len], ack_payload);
+    std.mem.writeInt(u32, hb_payload_buf[ack_payload.len..][0..4], max_offset, .big);
+    const hb_payload = hb_payload_buf[0 .. ack_payload.len + 4];
+
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
         .heartbeat,
         0,
         s.reliable_recv.ack(),
         s.reliable_recv.ackBits(),
-        ack_payload,
+        hb_payload,
         &pkt_buf,
     );
     try s.peer.send(&s.udp_sock, pkt);
@@ -227,14 +239,10 @@ export fn zmosh_connect(
     };
     errdefer reliable_send.deinit();
 
-    // Send Init with terminal size + receive buffer capacity (reliable)
-    const init_msg = ipc.InitMsg{
-        .rows = rows,
-        .cols = cols,
-        .recv_buf_size = udp_mod.UdpSocket.getSocketBufSize(sock_fd, posix.SO.RCVBUF),
-    };
+    // Send Init with terminal size (reliable)
+    const init_size = ipc.Resize{ .rows = rows, .cols = cols };
     var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&init_msg), &init_buf);
+    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&init_size), &init_buf);
 
     const init_packet = reliable_send.buildAndTrack(.reliable_ipc, init_ipc, 0, 0, now) catch {
         reliable_send.deinit();

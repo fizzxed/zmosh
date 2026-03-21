@@ -171,6 +171,8 @@ fn sendHeartbeat(
     sock: *udp_mod.UdpSocket,
     reliable_recv: *const transport.RecvState,
     output_ack_tracker: *const loss.OutputAckTracker,
+    output_recv: *const transport.OutputRecvState,
+    stdout_buf_len: usize,
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     now: i64,
@@ -195,13 +197,23 @@ fn sendHeartbeat(
         });
     }
 
+    // Append flow control max_offset after ACK ranges
+    const reorder_cap = @as(usize, transport.OutputRecvState.window_size) * @as(usize, transport.step);
+    const recv_window = @min(max_stdout_buf -| stdout_buf_len, reorder_cap);
+    const max_offset = output_recv.next_offset +% @as(u32, @intCast(@min(recv_window, std.math.maxInt(u32))));
+
+    var hb_payload_buf: [256]u8 = undefined;
+    @memcpy(hb_payload_buf[0..ack_payload.len], ack_payload);
+    std.mem.writeInt(u32, hb_payload_buf[ack_payload.len..][0..4], max_offset, .big);
+    const hb_payload = hb_payload_buf[0 .. ack_payload.len + 4];
+
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
         .heartbeat,
         0,
         reliable_recv.ack(),
         reliable_recv.ackBits(),
-        ack_payload,
+        hb_payload,
         &pkt_buf,
     );
     try peer.send(sock, pkt);
@@ -359,15 +371,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var output_pkts_this_interval: u64 = 0;
     var last_output_pkt_ns: i64 = 0;
 
-    // Send Init message with terminal size + receive buffer capacity (reliable)
+    // Send Init message with terminal size (reliable)
     const term_size = getTerminalSize();
-    const init_msg = ipc.InitMsg{
-        .rows = term_size.rows,
-        .cols = term_size.cols,
-        .recv_buf_size = udp_mod.UdpSocket.getSocketBufSize(sock_fd, posix.SO.RCVBUF),
-    };
     var init_buf: [64]u8 = undefined;
-    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&init_msg), &init_buf);
+    const init_ipc = transport.buildIpcBytes(.Init, std.mem.asBytes(&term_size), &init_buf);
     try sendReliablePayload(&peer, &udp_sock, &reliable_send, &reliable_recv, .reliable_ipc, init_ipc, last_ack_send_ns);
 
     while (true) {
@@ -388,9 +395,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
         // Ack heartbeat + keepalive heartbeat.
         if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &last_ack_send_ns, &ack_dirty, now, debug_log) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &output_recv, stdout_buf.items.len, &last_ack_send_ns, &ack_dirty, now, debug_log) catch {};
         } else if (peer.shouldSendHeartbeat(now, config)) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &last_ack_send_ns, &ack_dirty, now, debug_log) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &output_recv, stdout_buf.items.len, &last_ack_send_ns, &ack_dirty, now, debug_log) catch {};
         }
 
         // State check

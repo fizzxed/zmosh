@@ -1,6 +1,5 @@
 const std = @import("std");
 const posix = std.posix;
-const builtin = @import("builtin");
 const crypto = @import("crypto.zig");
 
 const log = std.log.scoped(.udp);
@@ -45,19 +44,6 @@ pub const UdpSocket = struct {
         const size: i32 = target_buf_size;
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&size)) catch {};
-    }
-
-    /// Query the actual send buffer the kernel granted (may be less than
-    /// requested if wmem_max is low). This limits how much the server can
-    /// burst via sendto() before EAGAIN. Linux doubles the setsockopt
-    /// value (half for kernel overhead), so usable ≈ raw / 2.
-    pub fn getSocketBufSize(fd: posix.fd_t, comptime opt: u32) u32 {
-        const c = std.c;
-        var size: c_int = 0;
-        var len: posix.socklen_t = @sizeOf(c_int);
-        const rc = c.getsockopt(fd, posix.SOL.SOCKET, @intCast(opt), @ptrCast(&size), &len);
-        if (rc == 0 and size > 0) return @intCast(size);
-        return if (builtin.os.tag == .linux) 212992 else target_buf_size;
     }
 
     fn bindFamily(family: u32, port_start: u16, port_end: u16, set_v6only: bool) ?UdpSocket {
