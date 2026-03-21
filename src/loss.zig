@@ -269,6 +269,9 @@ pub const LossDetector = struct {
             const entry = &send_buf.entries[i];
             if (!entry.in_use or entry.acked or entry.offset != offset) continue;
 
+            // Only consider packets genuinely behind largest_acked (wrapping-safe)
+            if (!seqGt(self.largest_acked, offset)) continue;
+
             // Packet threshold: lost if 3 later packets ACKed (in slots)
             if ((self.largest_acked -% offset) / transport.step >= packet_threshold) {
                 if (!isInQueue(retransmit_list, offset)) {
@@ -597,6 +600,32 @@ test "LossDetector packet threshold" {
     try std.testing.expectEqual(@as(usize, 2), lost.items.len);
     try std.testing.expectEqual(@as(u32, 0), lost.items[0]);
     try std.testing.expectEqual(@as(u32, step), lost.items[1]);
+}
+
+test "LossDetector does not declare packets ahead of largest_acked as lost" {
+    const step = transport.step;
+    var det = LossDetector{};
+    var send_buf = try SendBuffer.init(std.testing.allocator);
+    defer send_buf.deinit(std.testing.allocator);
+
+    // Send offsets 0..5*step, ACK only offset 2*step
+    for (0..6) |i| {
+        const offset: u32 = @intCast(i * step);
+        send_buf.recordSend(offset, "x", @intCast((i + 1) * 1000), .{});
+    }
+    _ = send_buf.markAcked(2 * step);
+    det.onAck(2 * step);
+
+    var lost_buf: [64]u32 = undefined;
+    var lost = std.ArrayListUnmanaged(u32).initBuffer(&lost_buf);
+    _ = det.detectLosses(&send_buf, 100000, 50_000_000, 50_000_000, &lost);
+
+    // Only offsets behind largest_acked can be lost.
+    // Offsets 3*step, 4*step, 5*step are AHEAD — must NOT be declared lost.
+    // Offset 0: (2*step - 0)/step = 2 < 3 → not lost by packet threshold
+    // Offset step: (2*step - step)/step = 1 < 3 → not lost
+    // (time threshold won't fire at now=100000 with loss_delay ~56ms)
+    try std.testing.expectEqual(@as(usize, 0), lost.items.len);
 }
 
 test "LossDetector PTO computation" {
