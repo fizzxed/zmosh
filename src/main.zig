@@ -549,9 +549,9 @@ const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        if (payload.len < @sizeOf(ipc.Resize)) return;
+        if (payload.len != @sizeOf(ipc.Resize)) return;
 
-        const resize = std.mem.bytesToValue(ipc.Resize, payload[0..@sizeOf(ipc.Resize)]);
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
 
         // Serialize terminal state BEFORE resize to capture the pre-reflow
         // cursor position. We gate on has_pty_output so that the very first
@@ -592,9 +592,9 @@ const Daemon = struct {
     }
 
     pub fn handleResize(self: *Daemon, pty_fd: i32, term: *ghostty_vt.Terminal, payload: []const u8) !void {
-        if (payload.len < @sizeOf(ipc.Resize)) return;
+        if (payload.len != @sizeOf(ipc.Resize)) return;
 
-        const resize = std.mem.bytesToValue(ipc.Resize, payload[0..@sizeOf(ipc.Resize)]);
+        const resize = std.mem.bytesToValue(ipc.Resize, payload);
         var ws: cross.c.struct_winsize = .{
             .ws_row = resize.rows,
             .ws_col = resize.cols,

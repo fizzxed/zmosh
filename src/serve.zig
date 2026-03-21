@@ -701,8 +701,8 @@ pub const Gateway = struct {
 
             const hdr = std.mem.bytesToValue(ipc.Header, remaining[0..@sizeOf(ipc.Header)]);
             const msg_payload = remaining[@sizeOf(ipc.Header)..msg_len];
-            if ((hdr.tag == .Init or hdr.tag == .Resize) and msg_payload.len >= @sizeOf(ipc.Resize)) {
-                self.last_resize = std.mem.bytesToValue(ipc.Resize, msg_payload[0..@sizeOf(ipc.Resize)]);
+            if ((hdr.tag == .Init or hdr.tag == .Resize) and msg_payload.len == @sizeOf(ipc.Resize)) {
+                self.last_resize = std.mem.bytesToValue(ipc.Resize, msg_payload);
                 self.have_client_size = true;
             }
 
