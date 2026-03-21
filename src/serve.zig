@@ -15,6 +15,13 @@ const max_output_coalesce = 2 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
+fn debugWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
+    const file = f orelse return;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    file.writeAll(msg) catch return;
+}
+
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn handleSigterm(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
@@ -102,6 +109,9 @@ pub const Gateway = struct {
     have_client_size: bool,
     last_resize: ipc.Resize,
 
+    debug_log: ?std.fs.File = null,
+    last_stats_ns: i64 = 0,
+    output_pkts_sent: u64 = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -197,6 +207,8 @@ pub const Gateway = struct {
             .last_resize = .{ .rows = 24, .cols = 80 },
         };
         gw.retransmit_queue = std.ArrayListUnmanaged(u32).initBuffer(&gw.retransmit_buf);
+        gw.debug_log = std.fs.createFileAbsolute("/tmp/zmosh-server-debug.log", .{ .truncate = true }) catch null;
+        debugWrite(gw.debug_log, "zmosh server debug started\n", .{});
         return gw;
     }
 
@@ -253,6 +265,25 @@ pub const Gateway = struct {
             poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
 
             const poll_timeout = self.computePollTimeoutMs(now);
+
+            if (now - self.last_stats_ns >= 2 * std.time.ns_per_s) {
+                const srtt_ms: i64 = if (self.output_srtt_ns > 0) @divFloor(self.output_srtt_ns, std.time.ns_per_ms) else -1;
+                debugWrite(self.debug_log, "S offset={d} pending={d} retx={d} inflight={d} cwnd={d} bw={d} state={d} lost={d} srtt={d} pkts={d} burst={d}\n", .{
+                    self.output_offset,
+                    self.pending_output.items.len,
+                    self.retransmit_queue.items.len,
+                    self.bbr.inflight,
+                    self.bbr.cwnd,
+                    self.bbr.bw,
+                    @intFromEnum(self.bbr.state),
+                    self.bbr.total_lost,
+                    srtt_ms,
+                    self.output_pkts_sent,
+                    self.pacer.burst_remaining,
+                });
+                self.last_stats_ns = now;
+            }
+
             _ = posix.poll(&poll_fds, poll_timeout) catch |err| {
                 if (err == error.Interrupted) continue;
                 return err;
@@ -443,6 +474,7 @@ pub const Gateway = struct {
 
             self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
             self.output_offset +%= transport.step;
+            self.output_pkts_sent += 1;
 
             // Remove sent data from pending buffer
             self.pending_output.replaceRange(self.alloc, 0, end, &[_]u8{}) catch unreachable;
@@ -818,6 +850,7 @@ pub const Gateway = struct {
     }
 
     pub fn deinit(self: *Gateway) void {
+        if (self.debug_log) |f| f.close();
         posix.close(self.unix_fd);
         self.udp_sock.close();
         self.unix_read_buf.deinit();
