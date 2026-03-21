@@ -454,6 +454,17 @@ pub const Gateway = struct {
                     }
                 }
 
+                // Skip delivery rate sample for retransmitted packets (spec §4.1.2):
+                // "The sender MAY choose to skip the generation of a delivery rate
+                // sample for a retransmitted sequence range."
+                // Retransmits have stale delivery_state, producing inaccurate rates.
+                if (entry.retransmit_count > 0) {
+                    gw.bbr.inflight -|= entry.size;
+                    gw.bbr.delivered += entry.size;
+                    gw.bbr.delivered_time = n;
+                    return;
+                }
+
                 // TODO: Per spec, accumulate rate samples across all ACKed packets
                 // in this ACK event, then call BBR model+control update once.
                 // Current per-packet approach is conservative but may over-count rounds.
@@ -461,7 +472,7 @@ pub const Gateway = struct {
                     .size = entry.size,
                     .sent_time = entry.sent_time,
                     .delivery_state = entry.delivery_state,
-                    .rtt_ns = if (entry.retransmit_count == 0) n - entry.sent_time else 0,
+                    .rtt_ns = n - entry.sent_time,
                 }, entry.size, n);
             }
         };

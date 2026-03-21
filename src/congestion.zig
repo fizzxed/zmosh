@@ -261,6 +261,9 @@ pub const Bbr = struct {
     last_startup_lost_seq: u32 = 0, // last lost seq for discontiguous tracking
     has_last_startup_lost: bool = false, // whether last_startup_lost_seq is valid
 
+    // --- Loss recovery state ---
+    in_loss_recovery: bool = false, // set by onSevereLoss, cleared by restoreCwnd
+
     // --- Undo state (for spurious loss recovery) ---
     undo_state: BbrState = .startup,
     undo_probe_bw_phase: ProbeBwPhase = .down,
@@ -617,12 +620,13 @@ pub const Bbr = struct {
             @intCast(now - self.extra_acked_interval_start)
         else
             0;
-        const expected_delivered = self.bw * interval_ns / ns_per_s;
+        var expected_delivered = self.bw * interval_ns / ns_per_s;
 
-        // Reset interval if ACK rate is below expected rate
+        // Reset interval if ACK rate is below expected rate (spec §5.5.9)
         if (self.extra_acked_delivered <= expected_delivered) {
             self.extra_acked_delivered = 0;
             self.extra_acked_interval_start = now;
+            expected_delivered = 0;
         }
         self.extra_acked_delivered += rs.newly_acked;
 
@@ -987,7 +991,7 @@ pub const Bbr = struct {
     }
 
     fn saveCwnd(self: *Bbr) void {
-        if (self.state != .probe_rtt) {
+        if (!self.in_loss_recovery and self.state != .probe_rtt) {
             self.prior_cwnd = self.cwnd;
         } else {
             self.prior_cwnd = @max(self.prior_cwnd, self.cwnd);
@@ -996,6 +1000,7 @@ pub const Bbr = struct {
 
     fn restoreCwnd(self: *Bbr) void {
         self.cwnd = @max(self.cwnd, self.prior_cwnd);
+        self.in_loss_recovery = false;
     }
 
     fn saveStateUponLoss(self: *Bbr) void {
@@ -1035,6 +1040,7 @@ pub const Bbr = struct {
     pub fn onSevereLoss(self: *Bbr) void {
         self.saveCwnd();
         self.saveStateUponLoss();
+        self.in_loss_recovery = true;
         self.cwnd = @as(u32, self.inflight) +| max_datagram_size;
     }
 
