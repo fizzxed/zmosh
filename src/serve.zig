@@ -490,8 +490,14 @@ pub const Gateway = struct {
             self.pending_output.replaceRange(self.alloc, 0, end, &[_]u8{}) catch unreachable;
         }
 
-        // If both queues are empty, mark app-limited
-        if (self.pending_output.items.len == 0 and self.retransmit_queue.items.len == 0) {
+        // Mark app-limited when we can't fill the pipe: either no data to
+        // send, or flow control is blocking. Without this, BBR treats
+        // flow-control pauses as bandwidth signals, collapsing bw estimates.
+        const flow_blocked = self.client_max_offset != std.math.maxInt(u32) and blk: {
+            const room = self.client_max_offset -% self.output_offset;
+            break :blk room == 0 or room >= 0x80000000;
+        };
+        if ((self.pending_output.items.len == 0 and self.retransmit_queue.items.len == 0) or flow_blocked) {
             self.bbr.setAppLimited();
         }
 
