@@ -501,7 +501,7 @@ pub const Bbr = struct {
     pub fn bdp(self: *const Bbr) u64 {
         const mrtt = self.getMinRtt();
         if (mrtt <= 0 or self.bw == 0) return @as(u64, initial_cwnd);
-        return @intCast(@min(@as(u128, self.bw) * @as(u128, @intCast(mrtt)) / ns_per_s, max_u64));
+        return self.bw * @as(u64, @intCast(mrtt)) / ns_per_s;
     }
 
     pub fn getMinRtt(self: *const Bbr) i64 {
@@ -513,25 +513,24 @@ pub const Bbr = struct {
     // Internal: Delivery Rate Sample
     // ------------------------------------------------------------------
 
+    /// Compute delivery rate sample per spec §4.1.1.2.4:
+    ///   delivery_elapsed = max(ack_elapsed, send_elapsed)
+    ///   delivery_rate = data_acked / delivery_elapsed
+    /// This is equivalent to min(send_rate, ack_rate) since both share
+    /// the same numerator (data_acked).
     fn computeRateSample(self: *const Bbr, pkt: AckedPacket, now: i64) RateSample {
         const ds = pkt.delivery_state;
         const delivered_delta = self.delivered - ds.delivered;
         if (delivered_delta == 0) return .{ .prior_delivered = ds.delivered };
 
-        // Send-side: bytes sent between snapshot and now / send time delta
-        const send_bytes_delta = self.total_bytes_sent -| ds.total_bytes_sent;
         const send_elapsed = pkt.sent_time - ds.first_sent_time;
+        const ack_elapsed = now - ds.delivered_time;
+        var interval = @max(send_elapsed, ack_elapsed);
+        if (interval <= 0) interval = 1;
 
-        // ACK-side: bytes delivered between snapshot and now / ack time delta
-        // (A0 point adjustment applied in computeAckRate when available)
-        const ack_bytes_delta = delivered_delta;
-        const ack_elapsed = self.computeAckElapsed(ds, now);
-
-        // Discard when both intervals are unreliably short (< min_rtt)
+        // Spec §4.1.2.3: discard unreliably short intervals
         const min_rtt_val = self.getMinRtt();
-        if (min_rtt_val > 0 and send_elapsed > 0 and send_elapsed < min_rtt_val and
-            ack_elapsed > 0 and ack_elapsed < min_rtt_val)
-        {
+        if (min_rtt_val > 0 and interval < min_rtt_val) {
             return .{
                 .rtt_ns = pkt.rtt_ns,
                 .delivered = delivered_delta,
@@ -541,17 +540,7 @@ pub const Bbr = struct {
             };
         }
 
-        // Compute two independent rates; take the minimum (Google/Cloudflare approach).
-        // Use u128 intermediates to prevent overflow (bytes * 1e9 can exceed u64).
-        const send_rate: u64 = if (send_elapsed > 0)
-            @intCast(@as(u128, send_bytes_delta) * ns_per_s / @as(u128, @intCast(send_elapsed)))
-        else
-            max_u64;
-        const ack_rate: u64 = if (ack_elapsed > 0)
-            @intCast(@as(u128, ack_bytes_delta) * ns_per_s / @as(u128, @intCast(ack_elapsed)))
-        else
-            max_u64;
-        const rate = @min(send_rate, ack_rate);
+        const rate = delivered_delta * ns_per_s / @as(u64, @intCast(interval));
 
         return .{
             .delivery_rate = rate,
@@ -562,18 +551,6 @@ pub const Bbr = struct {
             .tx_in_flight = ds.tx_in_flight,
             .prior_delivered = ds.delivered,
         };
-    }
-
-    /// Compute ACK-side elapsed time, using A0 point if available for a wider
-    /// measurement baseline (overestimate avoidance, per Google/Cloudflare).
-    fn computeAckElapsed(self: *const Bbr, ds: DeliveryState, now: i64) i64 {
-        if (self.a0_count > 0) {
-            if (self.selectA0(ds.delivered)) |a0| {
-                const elapsed = now - a0.ack_time;
-                if (elapsed > 0) return elapsed;
-            }
-        }
-        return now - ds.delivered_time;
     }
 
     /// Select the A0 candidate whose total_bytes_acked is closest to (but not
@@ -749,7 +726,7 @@ pub const Bbr = struct {
             @intCast(now - self.extra_acked_interval_start)
         else
             0;
-        var expected_delivered: u64 = @intCast(@min(@as(u128, self.bw) * @as(u128, interval_ns) / ns_per_s, max_u64));
+        var expected_delivered = self.bw * interval_ns / ns_per_s;
 
         // Reset interval if ACK rate is below expected rate (spec §5.5.9)
         if (self.extra_acked_delivered <= expected_delivered) {
@@ -1102,7 +1079,7 @@ pub const Bbr = struct {
 
     fn probeRTTCwnd(self: *const Bbr) u32 {
         const probe_cwnd = self.bdpMultiple(probe_rtt_cwnd_gain);
-        return @intCast(@min(@max(probe_cwnd, min_cwnd), max_u32));
+        return @intCast(@max(probe_cwnd, min_cwnd));
     }
 
     fn checkProbeRTTDone(self: *Bbr, now: i64) void {
@@ -1199,8 +1176,8 @@ pub const Bbr = struct {
 
     fn bdpMultiple(self: *const Bbr, gain: u32) u64 {
         if (self.min_rtt == max_i64) return @as(u64, initial_cwnd);
-        const bdp_val: u128 = @as(u128, self.bw) * @as(u128, @intCast(self.min_rtt)) / ns_per_s;
-        return @intCast(@min(bdp_val * gain / 256, max_u64));
+        const bdp_val = self.bw * @as(u64, @intCast(self.min_rtt)) / ns_per_s;
+        return bdp_val * @as(u64, gain) / 256;
     }
 
     // NOTE: BBRSetSendQuantum (spec §5.6.3) is intentionally not implemented.
@@ -1271,10 +1248,9 @@ pub const Bbr = struct {
     }
 
     fn setPacingRateWithGain(self: *Bbr, gain: u32) void {
-        const rate = @as(u128, self.bw) * gain / 256 * (100 - pacing_margin_percent) / 100;
-        const clamped: u64 = @intCast(@min(rate, max_u64));
-        if (self.full_bw_reached or clamped > self.pacing_rate) {
-            self.pacing_rate = clamped;
+        const rate = self.bw * @as(u64, gain) / 256 * (100 - pacing_margin_percent) / 100;
+        if (self.full_bw_reached or rate > self.pacing_rate) {
+            self.pacing_rate = rate;
         }
     }
 
@@ -1619,7 +1595,7 @@ test "u128 BDP computation does not overflow" {
     try std.testing.expectEqual(@as(u64, 10_000_000_000), result);
 }
 
-test "min rate sampling: send_rate caps burst overestimation" {
+test "rate sampling: max interval caps burst overestimation" {
     var bbr = Bbr{};
     const base: i64 = 1_000_000_000;
 
@@ -1629,17 +1605,14 @@ test "min rate sampling: send_rate caps burst overestimation" {
     }
 
     // Simulate ACK arriving at T+50ms for a packet sent at T=0
-    // with delivery state from the first send
     bbr.delivered = 12000; // 10 packets acked
     bbr.delivered_time = base + 50 * std.time.ns_per_ms;
-    bbr.total_bytes_sent = 12000;
     bbr.min_rtt = 50 * std.time.ns_per_ms;
 
     const ds = DeliveryState{
         .delivered = 0,
         .delivered_time = base,
         .first_sent_time = base,
-        .total_bytes_sent = 0,
     };
     const rs = bbr.computeRateSample(.{
         .size = 1200,
@@ -1648,9 +1621,9 @@ test "min rate sampling: send_rate caps burst overestimation" {
         .rtt_ns = 50 * std.time.ns_per_ms,
     }, base + 50 * std.time.ns_per_ms);
 
-    // send_rate = 12000 bytes / 0ns → infinite (burst sent instantly)
-    // ack_rate = 12000 bytes / 50ms = 240000 bytes/s
-    // min(send_rate, ack_rate) = 240000
+    // send_elapsed = 0 (burst), ack_elapsed = 50ms
+    // interval = max(0, 50ms) = 50ms
+    // rate = 12000 / 50ms = 240000 bytes/s
     try std.testing.expectEqual(@as(u64, 240_000), rs.delivery_rate);
 }
 
