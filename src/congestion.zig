@@ -287,6 +287,11 @@ pub const Bbr = struct {
             self.delivered_time = now;
         }
 
+        // Clear app-limited once we've sent enough to fill the pipe (spec 4.1.2)
+        if (self.is_app_limited and self.delivered + self.inflight >= self.app_limited_seq) {
+            self.is_app_limited = false;
+        }
+
         // Seed PRNG on first send
         if (self.rng_state == 0) {
             self.rng_state = @as(u64, @bitCast(now)) | 1;
