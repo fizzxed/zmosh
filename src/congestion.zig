@@ -1260,29 +1260,58 @@ pub const Bbr = struct {
 
 pub const Pacer = struct {
     next_send_time: i64 = 0,
+    /// Remaining burst budget in bytes. When the pacer fires, it grants
+    /// send_quantum bytes that can be sent without per-packet pacing.
+    /// This amortizes poll() overhead (millisecond granularity) for sub-ms
+    /// pacing intervals. Matches QUIC implementations (quinn, quiche,
+    /// quic-go) that send aggregated bursts on each timer tick.
+    burst_remaining: u32 = 0,
 
     pub fn canSend(self: *const Pacer, now: i64) bool {
-        return now >= self.next_send_time;
+        return self.burst_remaining > 0 or now >= self.next_send_time;
     }
 
     pub fn onSend(self: *Pacer, now: i64, packet_size: u32, pacing_rate: u64) void {
+        if (self.burst_remaining >= packet_size) {
+            self.burst_remaining -= packet_size;
+            return;
+        }
+        self.burst_remaining = 0;
+
+        const quantum = sendQuantum(pacing_rate);
+
         if (pacing_rate == 0) {
             self.next_send_time = now;
+            self.burst_remaining = quantum -| packet_size;
             return;
         }
 
-        const interval_ns: i64 = @intCast(@as(u64, packet_size) * ns_per_s / pacing_rate);
+        // Schedule next burst after send_quantum bytes worth of pacing time.
+        const burst_interval_ns: i64 = @intCast(@as(u64, quantum) * ns_per_s / pacing_rate);
 
         if (now >= self.next_send_time) {
-            // If behind schedule, reset to now (no burst catch-up)
-            self.next_send_time = now + interval_ns;
+            self.next_send_time = now + burst_interval_ns;
         } else {
-            self.next_send_time += interval_ns;
+            self.next_send_time += burst_interval_ns;
         }
+        self.burst_remaining = quantum -| packet_size;
+    }
+
+    /// BBRSetSendQuantum (spec §5.6.3):
+    ///   send_quantum = clamp(floor(0.02 * pacing_rate), 2*SMSS, 64KB)
+    /// The 2% factor gives ~20ms of data at the current rate, amortizing
+    /// per-packet overhead for sub-millisecond pacing intervals.
+    fn sendQuantum(pacing_rate: u64) u32 {
+        const floor = 2 * max_datagram_size; // 2 SMSS
+        const ceil = 65535; // spec cap
+        if (pacing_rate == 0) return floor;
+        // 2% of pacing_rate (bytes/sec) = pacing_rate / 50
+        const dynamic: u64 = pacing_rate / 50;
+        return @intCast(@min(ceil, @max(floor, dynamic)));
     }
 
     pub fn pollTimeoutMs(self: *const Pacer, now: i64) i32 {
-        if (now >= self.next_send_time) return 0;
+        if (self.burst_remaining > 0 or now >= self.next_send_time) return 0;
         const remaining_ns = self.next_send_time - now;
         const ms = @divFloor(remaining_ns, std.time.ns_per_ms);
         return @intCast(@max(@as(i64, 0), @min(ms, 1000)));

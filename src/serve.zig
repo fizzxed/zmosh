@@ -102,6 +102,7 @@ pub const Gateway = struct {
     have_client_size: bool,
     last_resize: ipc.Resize,
 
+
     pub fn init(
         alloc: std.mem.Allocator,
         session_name: []const u8,
