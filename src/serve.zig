@@ -82,6 +82,12 @@ pub const Gateway = struct {
     output_rttvar_ns: i64 = 0,
     output_latest_rtt_ns: i64 = 0,
 
+    // Timestamp of last ACK progress (largest_acked advanced).
+    // Used to trigger onSevereLoss when no ACK progress for multiple RTOs.
+    last_ack_progress_ns: i64 = 0,
+    prev_largest_acked: u32 = 0,
+    has_prev_largest_acked: bool = false,
+
     config: udp.Config,
     running: bool,
 
@@ -171,6 +177,9 @@ pub const Gateway = struct {
             .output_srtt_ns = 0,
             .output_rttvar_ns = 0,
             .output_latest_rtt_ns = 0,
+            .last_ack_progress_ns = 0,
+            .prev_largest_acked = 0,
+            .has_prev_largest_acked = false,
             .loss_detection_timer = 0,
             .config = config,
             .running = true,
@@ -432,23 +441,46 @@ pub const Gateway = struct {
 
         self.loss_detector.onAck(ranges.largest_acked);
 
+        // Track ACK progress for onSevereLoss detection
+        if (!self.has_prev_largest_acked or ranges.largest_acked != self.prev_largest_acked) {
+            self.last_ack_progress_ns = now;
+            self.prev_largest_acked = ranges.largest_acked;
+            self.has_prev_largest_acked = true;
+        }
+
+        // Begin batched ACK event (spec §5.2.3: BBRUpdateOnACK runs once)
+        self.bbr.beginAck();
+
+        // Track whether any packet in the retransmit queue was ACKed (spurious loss)
+        var spurious_detected = false;
+
         // Process ACKed seqs
         const Ctx = struct {
             gw: *Gateway,
             now_ns: i64,
+            spurious: *bool,
         };
-        const ctx = Ctx{ .gw = self, .now_ns = now };
+        const ctx = Ctx{ .gw = self, .now_ns = now, .spurious = &spurious_detected };
         const Handler = struct {
             ctx_inner: Ctx,
 
             pub fn call(handler: @This(), seq: u32) void {
                 const gw = handler.ctx_inner.gw;
                 const n = handler.ctx_inner.now_ns;
+
+                // Spurious loss detection: if this seq is in the retransmit queue
+                // (declared lost) but arrives ACKed, the loss was spurious.
+                for (gw.retransmit_queue.items, 0..) |rseq, idx| {
+                    if (rseq == seq) {
+                        _ = gw.retransmit_queue.orderedRemove(idx);
+                        handler.ctx_inner.spurious.* = true;
+                        break;
+                    }
+                }
+
                 const entry = gw.send_buf.markAcked(seq) orelse return;
 
-                // RTT: Karn's algorithm — only use non-retransmitted packets.
-                // Update Gateway's own SRTT (not Peer's — Peer measures
-                // heartbeat-to-heartbeat which inflates during idle).
+                // RTT: Karn's algorithm -- only use non-retransmitted packets.
                 if (entry.retransmit_count == 0) {
                     const rtt_ns = n - entry.sent_time;
                     if (rtt_ns > 0) {
@@ -456,32 +488,28 @@ pub const Gateway = struct {
                     }
                 }
 
-                // Skip delivery rate sample for retransmitted packets (spec §4.1.2):
-                // "The sender MAY choose to skip the generation of a delivery rate
-                // sample for a retransmitted sequence range."
-                // Retransmits have stale delivery_state, producing inaccurate rates.
-                if (entry.retransmit_count > 0) {
-                    gw.bbr.inflight -|= entry.size;
-                    gw.bbr.delivered += entry.size;
-                    gw.bbr.delivered_time = n;
-                    return;
-                }
-
-                // TODO: Per spec, accumulate rate samples across all ACKed packets
-                // in this ACK event, then call BBR model+control update once.
-                // Current per-packet approach is conservative but may over-count rounds.
-                gw.bbr.onAck(.{
+                // Per spec §4.1.2.3: accumulate delivery info per-packet,
+                // run model+control update once in endAck.
+                gw.bbr.onAckPacket(.{
                     .size = entry.size,
                     .sent_time = entry.sent_time,
                     .delivery_state = entry.delivery_state,
-                    .rtt_ns = n - entry.sent_time,
-                }, entry.size, n);
+                    .rtt_ns = if (entry.retransmit_count == 0) n - entry.sent_time else 0,
+                }, entry.retransmit_count > 0);
             }
         };
 
         ranges.iterateAcked(Handler{ .ctx_inner = ctx });
 
-        // Loss detection — uses Gateway's output-path SRTT (not Peer's)
+        // Finalize ACK event: compute rate sample and run model+control once
+        self.bbr.endAck(now);
+
+        // Handle spurious loss detection (spec §5.5.11.2)
+        if (spurious_detected) {
+            self.bbr.handleSpuriousLossDetection();
+        }
+
+        // Loss detection -- uses Gateway's output-path SRTT (not Peer's)
         const srtt_ns: i64 = if (self.output_srtt_ns > 0) self.output_srtt_ns else 100 * std.time.ns_per_ms;
         const latest = if (self.output_latest_rtt_ns > 0) self.output_latest_rtt_ns else srtt_ns;
         const prev_queue_len = self.retransmit_queue.items.len;
@@ -525,6 +553,17 @@ pub const Gateway = struct {
             if (self.send_buf.getForRetransmit(lost_seq)) |entry| {
                 const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
                 self.bbr.onLoss(lost_seq, entry.size, rs_lost + entry.size, entry.delivery_state.tx_in_flight, entry.delivery_state.is_app_limited);
+            }
+        }
+
+        // Severe loss detection (RTO-equivalent, spec §5.6.4.4):
+        // If no ACK progress for 4x SRTT (min 1s), trigger onSevereLoss.
+        if (self.has_prev_largest_acked and self.last_ack_progress_ns > 0) {
+            const rto_thresh = @max(4 * srtt_ns, std.time.ns_per_s);
+            if (now - self.last_ack_progress_ns > rto_thresh) {
+                self.bbr.onSevereLoss();
+                // Reset timer to avoid firing every tick
+                self.last_ack_progress_ns = now;
             }
         }
     }
@@ -701,6 +740,9 @@ pub const Gateway = struct {
             .output_srtt_ns = 0,
             .output_rttvar_ns = 0,
             .output_latest_rtt_ns = 0,
+            .last_ack_progress_ns = 0,
+            .prev_largest_acked = 0,
+            .has_prev_largest_acked = false,
             .loss_detection_timer = 0,
             .config = .{},
             .running = true,

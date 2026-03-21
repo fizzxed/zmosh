@@ -274,6 +274,10 @@ pub const Bbr = struct {
     // --- PRNG state ---
     rng_state: u64 = 0,
 
+    // --- Per-ACK-event accumulation (spec §5.2.3 batching) ---
+    pending_ack_newly_acked: u32 = 0,
+    pending_ack_best_pkt: ?AckedPacket = null, // most recently sent (IsNewestPacket)
+
     // ------------------------------------------------------------------
     // Public API
     // ------------------------------------------------------------------
@@ -321,9 +325,44 @@ pub const Bbr = struct {
         return ds;
     }
 
+    /// Legacy single-packet ACK handler. Wraps beginAck/onAckPacket/endAck
+    /// for backward compatibility with tests and single-packet ACK paths.
     pub fn onAck(self: *Bbr, pkt: AckedPacket, newly_acked: u32, now: i64) void {
+        _ = newly_acked;
+        self.beginAck();
+        self.onAckPacket(pkt, false);
+        self.endAck(now);
+    }
+
+    /// Begin processing an ACK event. Call before onAckPacket calls.
+    /// Per spec §5.2.3: BBRUpdateOnACK runs once per ACK event, not per packet.
+    pub fn beginAck(self: *Bbr) void {
+        self.pending_ack_newly_acked = 0;
+        self.pending_ack_best_pkt = null;
+    }
+
+    /// Process one ACKed packet within an ACK event (spec §4.1.2.3).
+    /// Updates C.delivered and tracks the most recently sent packet
+    /// for rate sampling (IsNewestPacket). Call endAck() after all packets.
+    pub fn onAckPacket(self: *Bbr, pkt: AckedPacket, is_retransmit: bool) void {
         self.inflight -|= pkt.size;
         self.delivered += pkt.size;
+        self.pending_ack_newly_acked += pkt.size;
+
+        // Skip retransmits for rate sampling (stale delivery_state)
+        if (is_retransmit) return;
+
+        // IsNewestPacket (spec §4.1.2.3): pick the most recently sent packet
+        if (self.pending_ack_best_pkt == null or
+            pkt.sent_time >= self.pending_ack_best_pkt.?.sent_time)
+        {
+            self.pending_ack_best_pkt = pkt;
+        }
+    }
+
+    /// Finalize ACK event: compute rate sample and run model+control updates
+    /// once per ACK event (spec §5.2.3: BBRUpdateOnACK).
+    pub fn endAck(self: *Bbr, now: i64) void {
         self.delivered_time = now;
 
         // GenerateRateSample: clear app-limited if bubble is ACKed (spec §4.1.2.3)
@@ -331,9 +370,10 @@ pub const Bbr = struct {
             self.is_app_limited = false;
         }
 
-        // Compute delivery rate sample
-        var rs = self.computeRateSample(pkt, now);
-        rs.newly_acked = newly_acked;
+        const best_pkt = self.pending_ack_best_pkt orelse return;
+
+        var rs = self.computeRateSample(best_pkt, now);
+        rs.newly_acked = self.pending_ack_newly_acked;
 
         // --- BBRUpdateModelAndState ---
         // BBRUpdateLatestDeliverySignals (spec 5.5.10.3)
@@ -556,9 +596,14 @@ pub const Bbr = struct {
 
         self.adaptLowerBoundsFromCongestion();
 
-        // Check startup high loss BEFORE resetting per-round counters.
-        // checkStartupHighLoss reads loss_in_round, bytes_lost_in_round,
-        // and startup_loss_events which get cleared below.
+        // NOTE: checkStartupHighLoss is called here (inside updateCongestionSignals)
+        // rather than from checkStartupDone as the spec pseudocode suggests (§5.2.3).
+        // This is an intentional ordering correction: the spec's BBRUpdateCongestionSignals
+        // resets loss_in_round/bytes_lost_in_round/startup_loss_events at the end of each
+        // loss round, but BBRCheckStartupHighLoss (called later via BBRCheckStartupDone)
+        // needs those values. Calling it here — after adaptLowerBoundsFromCongestion but
+        // before the reset — matches the spec's INTENT (exit Startup on sustained high
+        // loss) even though it diverges from the spec's literal call ordering.
         self.checkStartupHighLoss(rs);
 
         self.loss_in_round = false;
@@ -1079,10 +1124,14 @@ pub const Bbr = struct {
         return bdp_val * @as(u64, gain) / 256;
     }
 
+    // NOTE: BBRSetSendQuantum (spec §5.6.3) is intentionally not implemented.
+    // Our QUIC-like protocol sends individual UDP datagrams (1 SMSS each) without
+    // TSO/GSO offload. The spec explicitly allows this (§5.5.8.2): "For QUIC, in
+    // the simplest case, offload_budget is equal to the send quantum." Our implicit
+    // send_quantum = offload_budget = 1 * SMSS = max_datagram_size.
     fn quantizationBudget(self: *const Bbr, inflight_cap: u64) u32 {
         var cap = inflight_cap;
-        // offload_budget: for our QUIC-like protocol, 1 send_quantum = 1 SMSS
-        cap = @max(cap, max_datagram_size);
+        cap = @max(cap, max_datagram_size); // offload_budget = 1 SMSS
         cap = @max(cap, min_cwnd);
         if (self.state == .probe_bw and self.probe_bw_phase == .up) {
             cap += 2 * max_datagram_size;
