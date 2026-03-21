@@ -233,13 +233,14 @@ pub const Gateway = struct {
             // Handle incoming UDP datagrams → decrypt → decode transport packet
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
                 while (true) {
-                    var decrypt_buf: [9000]u8 = undefined;
-                    const recv_result = try self.peer.recv(&self.udp_sock, &decrypt_buf);
                     // Suppress Peer.recv() RTT measurement on the server side.
+                    // Must be BEFORE recv() so it sees null and skips measurement.
                     // Peer.recv() measures last-send-to-next-recv which during idle
                     // is just the heartbeat interval (~1s), not true RTT. BBR's
                     // processOutputAcks provides accurate per-packet RTT instead.
                     self.peer.last_send_time = null;
+                    var decrypt_buf: [9000]u8 = undefined;
+                    const recv_result = try self.peer.recv(&self.udp_sock, &decrypt_buf);
                     const result = recv_result orelse break;
                     try self.handleTransportPacket(result.data, now);
                 }

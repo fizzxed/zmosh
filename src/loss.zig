@@ -210,7 +210,10 @@ pub const LossDetector = struct {
     ) i64 {
         if (!self.has_largest_acked) return 0;
 
-        const loss_delay = @divFloor(time_threshold_num * @max(srtt_ns, latest_rtt_ns), time_threshold_den);
+        // Add max_ack_delay (5ms) to account for the client's ACK processing
+        // time, preventing spurious retransmits (similar to QUIC PTO).
+        const max_ack_delay_ns: i64 = 5 * std.time.ns_per_ms;
+        const loss_delay = @divFloor(time_threshold_num * @max(srtt_ns, latest_rtt_ns), time_threshold_den) + max_ack_delay_ns;
         var earliest_loss_time: i64 = 0;
 
         var seq = send_buf.head_seq;

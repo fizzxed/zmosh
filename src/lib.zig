@@ -8,7 +8,7 @@ const loss = @import("loss.zig");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_input_len = 1024 * 1024;
-const ack_delay_ns = 2 * std.time.ns_per_ms;
+const ack_delay_ns = 0;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
 // Silence all logging in library mode.

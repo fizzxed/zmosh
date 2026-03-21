@@ -9,9 +9,10 @@ const builtin = @import("builtin");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_stdout_buf = 16 * 1024 * 1024;
-// ACK delay must be shorter than the server's loss detection time threshold
-// (9/8 * RTT). With ~8ms RTT, threshold is ~9ms. Send ACKs within 2ms.
-const ack_delay_ns = 2 * std.time.ns_per_ms;
+// Send output ACKs immediately — any delay risks exceeding the server's
+// loss detection time threshold (9/8 * RTT), causing spurious retransmits
+// that poison BBR's congestion model.
+const ack_delay_ns = 0;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
 const c = switch (builtin.os.tag) {
@@ -415,7 +416,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             const rto_ms = @divFloor(peer.rto_us(), 1000);
             poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
         }
-        if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 2));
+        if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 0));
 
         // Periodic debug stats dump (placed here so poll_timeout is visible)
         if (now - last_stats_dump_ns >= 2 * std.time.ns_per_s) {
