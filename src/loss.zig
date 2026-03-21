@@ -167,6 +167,32 @@ pub const SendBuffer = struct {
         return entry.data[0..entry.data_len];
     }
 
+    /// Find the oldest unACKed packet's sent_time. Returns null if none.
+    pub fn oldestUnackedSentTime(self: *const SendBuffer) ?i64 {
+        var seq = self.head_seq;
+        while (seq != self.tail_seq) : (seq +%= 1) {
+            const i = idx(seq);
+            const entry = &self.entries[i];
+            if (entry.in_use and !entry.acked and entry.seq == seq) {
+                return entry.sent_time;
+            }
+        }
+        return null;
+    }
+
+    /// Find the oldest unACKed packet's seq. Returns null if none.
+    pub fn oldestUnackedSeq(self: *const SendBuffer) ?u32 {
+        var seq = self.head_seq;
+        while (seq != self.tail_seq) : (seq +%= 1) {
+            const i = idx(seq);
+            const entry = &self.entries[i];
+            if (entry.in_use and !entry.acked and entry.seq == seq) {
+                return seq;
+            }
+        }
+        return null;
+    }
+
     pub fn pruneAcked(self: *SendBuffer) void {
         while (self.head_seq != self.tail_seq) {
             const i = idx(self.head_seq);
@@ -179,8 +205,21 @@ pub const SendBuffer = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Loss Detector (RFC 9002 style)
+// Loss Detector (RFC 9002 §6.1 + §6.2)
+//
+// Architecture follows tquic/quiche: loss detection and PTO are separate
+// concerns. detectLosses() is pure §6.1 (packet + time thresholds).
+// The caller (serve.zig) manages a dual-mode timer that chooses between
+// loss_time and PTO, per §6.2.1 SetLossDetectionTimer.
 // ---------------------------------------------------------------------------
+
+/// Timer granularity floor (RFC 9002 §6.1.2). Prevents sub-millisecond
+/// loss thresholds on very low RTT paths.
+const granularity_ns: i64 = std.time.ns_per_ms;
+
+/// Peer's max ACK delay. Must match ack_delay_ns in remote.zig/lib.zig.
+/// Used in PTO calculation (RFC 9002 §6.2.1), NOT in loss detection.
+pub const max_ack_delay_ns: i64 = 5 * std.time.ns_per_ms;
 
 pub const LossDetector = struct {
     const packet_threshold: u32 = 3;
@@ -197,36 +236,29 @@ pub const LossDetector = struct {
         }
     }
 
-    /// Detect lost packets and append to retransmit_list.
-    /// Returns the earliest time a not-yet-lost packet might become lost
-    /// (for setting a loss detection timer), or 0 if no timer needed.
+    /// Detect lost packets per RFC 9002 §6.1.
+    ///
+    /// Uses two thresholds:
+    /// - Packet threshold (§6.1.1): lost if 3 later packets ACKed
+    /// - Time threshold (§6.1.2): lost if unACKed for > 9/8 × max(srtt, latest_rtt)
+    ///
+    /// Returns earliest_loss_time for the loss detection timer, or 0 if none.
+    /// max_ack_delay is NOT included here — it belongs in PTO (§6.2.1).
     pub fn detectLosses(
         self: *LossDetector,
         send_buf: *SendBuffer,
         now: i64,
         srtt_ns: i64,
         latest_rtt_ns: i64,
-        rttvar_ns: i64,
         retransmit_list: *std.ArrayListUnmanaged(u32),
     ) i64 {
         if (!self.has_largest_acked) return 0;
 
-        // RFC 9002 §6.1.2 time threshold + §6.2.1 PTO with max_ack_delay.
-        //
-        // In TCP, BBR delegates loss detection to RACK which has per-packet
-        // timestamps and immediate ACKs. In QUIC (and our protocol), ACKs are
-        // delayed/batched, so the loss timer must account for the peer's
-        // max_ack_delay. Without this, packets are declared lost before the
-        // ACK can realistically arrive.
-        //
-        // Formula: loss_delay = max(
-        //   9/8 * max(srtt, latest_rtt),          -- RFC 9002 §6.1.2
-        //   srtt + max(4 * rttvar, max_ack_delay)  -- RFC 9002 §6.2.1 PTO
-        // )
-        const max_ack_delay_ns: i64 = 5 * std.time.ns_per_ms; // matches client ack_delay_ns
-        const time_thresh = @divFloor(time_threshold_num * @max(srtt_ns, latest_rtt_ns), time_threshold_den);
-        const pto_thresh = srtt_ns + @max(4 * @max(rttvar_ns, std.time.ns_per_ms), max_ack_delay_ns);
-        const loss_delay = @max(time_thresh, pto_thresh);
+        // RFC 9002 §6.1.2: loss_delay = 9/8 × max(latest_rtt, smoothed_rtt)
+        const loss_delay = @max(
+            @divFloor(time_threshold_num * @max(srtt_ns, latest_rtt_ns), time_threshold_den),
+            granularity_ns,
+        );
         var earliest_loss_time: i64 = 0;
 
         var seq = send_buf.head_seq;
@@ -237,7 +269,6 @@ pub const LossDetector = struct {
 
             // Packet threshold: lost if 3 later packets ACKed
             if (self.largest_acked -% seq >= packet_threshold) {
-                // Skip if already queued for retransmit
                 if (!isInQueue(retransmit_list, seq)) {
                     retransmit_list.appendBounded(seq) catch continue;
                 }
@@ -259,6 +290,20 @@ pub const LossDetector = struct {
         }
 
         return earliest_loss_time;
+    }
+
+    /// Compute PTO duration per RFC 9002 §6.2.1.
+    ///
+    /// PTO = smoothed_rtt + max(4 × rttvar, granularity) + max_ack_delay
+    ///
+    /// This is separate from loss detection. PTO fires when loss detection
+    /// cannot make progress (no loss_time set), to send probe packets that
+    /// elicit ACKs from the peer.
+    pub fn computePto(srtt_ns: i64, rttvar_ns: i64, pto_count: u32) i64 {
+        const base = srtt_ns + @max(4 * rttvar_ns, granularity_ns) + max_ack_delay_ns;
+        // Exponential backoff: base × 2^pto_count (capped at 30 to avoid overflow)
+        const shift: u5 = @intCast(@min(pto_count, 30));
+        return base *| (@as(i64, 1) << shift);
     }
 
     fn isInQueue(list: *const std.ArrayListUnmanaged(u32), seq: u32) bool {
@@ -537,11 +582,26 @@ test "LossDetector packet threshold" {
 
     var lost_buf: [64]u32 = undefined;
     var lost = std.ArrayListUnmanaged(u32).initBuffer(&lost_buf);
-    det.detectLosses(&send_buf, 100000, 50_000_000, 50_000_000, 25_000_000, &lost);
+    _ = det.detectLosses(&send_buf, 100000, 50_000_000, 50_000_000, &lost);
 
     // Seq 1 is lost (4 - 1 = 3 >= threshold)
     try std.testing.expectEqual(@as(usize, 1), lost.items.len);
     try std.testing.expectEqual(@as(u32, 1), lost.items[0]);
+}
+
+test "LossDetector PTO computation" {
+    // srtt=50ms, rttvar=10ms, pto_count=0, max_ack_delay=5ms
+    // PTO = 50 + max(40, 1) + 5 = 95ms
+    const pto = LossDetector.computePto(50_000_000, 10_000_000, 0);
+    try std.testing.expectEqual(@as(i64, 95_000_000), pto);
+
+    // With pto_count=1: 95ms * 2 = 190ms
+    const pto1 = LossDetector.computePto(50_000_000, 10_000_000, 1);
+    try std.testing.expectEqual(@as(i64, 190_000_000), pto1);
+
+    // With pto_count=2: 95ms * 4 = 380ms
+    const pto2 = LossDetector.computePto(50_000_000, 10_000_000, 2);
+    try std.testing.expectEqual(@as(i64, 380_000_000), pto2);
 }
 
 test "OutputAckTracker sequential" {

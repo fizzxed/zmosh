@@ -73,7 +73,12 @@ pub const Gateway = struct {
     loss_detector: loss.LossDetector,
     retransmit_buf: [64]u32,
     retransmit_queue: std.ArrayListUnmanaged(u32),
-    loss_detection_timer: i64, // ns, 0 = no timer
+    // Dual-mode timer per RFC 9002 §6.2.1 SetLossDetectionTimer:
+    // - loss_time > 0: fire at loss_time to run detectLosses (time threshold)
+    // - loss_time == 0 && pto_time > 0: fire at pto_time to send probe
+    loss_time: i64 = 0, // earliest loss detection time, or 0
+    pto_time: i64 = 0, // PTO expiry time, or 0
+    pto_count: u32 = 0, // exponential backoff counter (reset on ACK progress)
 
     // Output-path RTT tracking (separate from Peer's RTT for reliable IPC).
     // Per spec §4.2: RS.rtt = Now() - P.send_time, computed per-packet.
@@ -83,7 +88,6 @@ pub const Gateway = struct {
     output_latest_rtt_ns: i64 = 0,
 
     // Timestamp of last ACK progress (largest_acked advanced).
-    // Used to trigger onSevereLoss when no ACK progress for multiple RTOs.
     last_ack_progress_ns: i64 = 0,
     prev_largest_acked: u32 = 0,
     has_prev_largest_acked: bool = false,
@@ -180,7 +184,9 @@ pub const Gateway = struct {
             .last_ack_progress_ns = 0,
             .prev_largest_acked = 0,
             .has_prev_largest_acked = false,
-            .loss_detection_timer = 0,
+            .loss_time = 0,
+            .pto_time = 0,
+            .pto_count = 0,
             .config = config,
             .running = true,
             .last_ack_send_ns = now,
@@ -211,9 +217,13 @@ pub const Gateway = struct {
                 break;
             }
 
-            // Timer-triggered loss detection (RFC 9002)
-            if (self.loss_detection_timer > 0 and now >= self.loss_detection_timer) {
-                self.runLossDetection(now);
+            // RFC 9002 §6.2.2 OnLossDetectionTimeout
+            if (self.loss_time > 0 and now >= self.loss_time) {
+                // Loss timer fired: run loss detection
+                self.onLossDetectionTimeout(now);
+            } else if (self.pto_time > 0 and now >= self.pto_time) {
+                // PTO fired: send probe to elicit ACK
+                self.onPtoTimeout(now);
             }
 
             try self.flushRetransmits(now);
@@ -319,9 +329,10 @@ pub const Gateway = struct {
             }
         }
 
-        // Loss detection timer
-        if (self.loss_detection_timer > 0) {
-            const remaining_ns = self.loss_detection_timer - now;
+        // Loss/PTO timer
+        const timer = if (self.loss_time > 0) self.loss_time else if (self.pto_time > 0) self.pto_time else @as(i64, 0);
+        if (timer > 0) {
+            const remaining_ns = timer - now;
             const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
             timeout = @min(timeout, remaining_ms);
         }
@@ -441,11 +452,12 @@ pub const Gateway = struct {
 
         self.loss_detector.onAck(ranges.largest_acked);
 
-        // Track ACK progress for onSevereLoss detection
+        // Track ACK progress and reset PTO backoff
         if (!self.has_prev_largest_acked or ranges.largest_acked != self.prev_largest_acked) {
             self.last_ack_progress_ns = now;
             self.prev_largest_acked = ranges.largest_acked;
             self.has_prev_largest_acked = true;
+            self.pto_count = 0; // Reset PTO backoff on ACK progress
         }
 
         // Begin batched ACK event (spec §5.2.3: BBRUpdateOnACK runs once)
@@ -512,9 +524,8 @@ pub const Gateway = struct {
         // Loss detection -- uses Gateway's output-path SRTT (not Peer's)
         const srtt_ns: i64 = if (self.output_srtt_ns > 0) self.output_srtt_ns else 100 * std.time.ns_per_ms;
         const latest = if (self.output_latest_rtt_ns > 0) self.output_latest_rtt_ns else srtt_ns;
-        const rttvar = if (self.output_rttvar_ns > 0) self.output_rttvar_ns else @divFloor(srtt_ns, 2);
         const prev_queue_len = self.retransmit_queue.items.len;
-        self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, rttvar, &self.retransmit_queue);
+        self.loss_time = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
         // Only notify BBR about NEWLY detected losses (not already-queued ones)
         for (self.retransmit_queue.items[prev_queue_len..]) |lost_seq| {
@@ -525,6 +536,7 @@ pub const Gateway = struct {
             }
         }
 
+        self.setLossDetectionTimer(now);
         self.send_buf.pruneAcked();
     }
 
@@ -541,16 +553,41 @@ pub const Gateway = struct {
         }
     }
 
-    /// Timer-triggered loss detection (RFC 9002 §6.1.2).
-    /// Called when loss_detection_timer fires without an ACK arrival.
-    fn runLossDetection(self: *Gateway, now: i64) void {
+    /// RFC 9002 §6.2.1 SetLossDetectionTimer.
+    /// Dual-mode: if loss_time is set, use it. Otherwise compute PTO.
+    fn setLossDetectionTimer(self: *Gateway, now: i64) void {
+        _ = now;
+        // If loss_time is set, that takes priority
+        if (self.loss_time > 0) {
+            self.pto_time = 0;
+            return;
+        }
+
+        // If no unacked packets, disable timer
+        if (self.send_buf.oldestUnackedSentTime() == null) {
+            self.loss_time = 0;
+            self.pto_time = 0;
+            return;
+        }
+
+        // Compute PTO
+        const srtt_ns: i64 = if (self.output_srtt_ns > 0) self.output_srtt_ns else 100 * std.time.ns_per_ms;
+        const rttvar = if (self.output_rttvar_ns > 0) self.output_rttvar_ns else @divFloor(srtt_ns, 2);
+        const pto_dur = loss.LossDetector.computePto(srtt_ns, rttvar, self.pto_count);
+
+        // PTO fires relative to the most recent ack-eliciting send
+        const last_sent = self.send_buf.oldestUnackedSentTime() orelse return;
+        self.pto_time = last_sent + pto_dur;
+    }
+
+    /// RFC 9002 §6.2.2 OnLossDetectionTimeout (loss timer mode).
+    /// Called when loss_time fires to run time-based loss detection.
+    fn onLossDetectionTimeout(self: *Gateway, now: i64) void {
         const srtt_ns: i64 = if (self.output_srtt_ns > 0) self.output_srtt_ns else 100 * std.time.ns_per_ms;
         const latest = if (self.output_latest_rtt_ns > 0) self.output_latest_rtt_ns else srtt_ns;
-        const rttvar = if (self.output_rttvar_ns > 0) self.output_rttvar_ns else @divFloor(srtt_ns, 2);
         const prev_queue_len = self.retransmit_queue.items.len;
-        self.loss_detection_timer = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, rttvar, &self.retransmit_queue);
+        self.loss_time = self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
 
-        // Only notify BBR about NEWLY detected losses
         for (self.retransmit_queue.items[prev_queue_len..]) |lost_seq| {
             if (self.send_buf.getForRetransmit(lost_seq)) |entry| {
                 const rs_lost = self.bbr.total_lost -| entry.delivery_state.lost;
@@ -558,16 +595,23 @@ pub const Gateway = struct {
             }
         }
 
-        // Severe loss detection (RTO-equivalent, spec §5.6.4.4):
-        // If no ACK progress for 4x SRTT (min 1s), trigger onSevereLoss.
-        if (self.has_prev_largest_acked and self.last_ack_progress_ns > 0) {
-            const rto_thresh = @max(4 * srtt_ns, std.time.ns_per_s);
-            if (now - self.last_ack_progress_ns > rto_thresh) {
-                self.bbr.onSevereLoss();
-                // Reset timer to avoid firing every tick
-                self.last_ack_progress_ns = now;
-            }
+        self.setLossDetectionTimer(now);
+    }
+
+    /// RFC 9002 §6.2.4 OnLossDetectionTimeout (PTO mode).
+    /// Retransmit the oldest unACKed packet as a probe to elicit ACKs.
+    fn onPtoTimeout(self: *Gateway, now: i64) void {
+        const probe_seq = self.send_buf.oldestUnackedSeq() orelse return;
+
+        // Queue for retransmission if not already queued
+        for (self.retransmit_queue.items) |s| {
+            if (s == probe_seq) break; // already queued
+        } else {
+            self.retransmit_queue.appendBounded(probe_seq) catch {};
         }
+
+        self.pto_count += 1;
+        self.setLossDetectionTimer(now);
     }
 
     fn flushRetransmits(self: *Gateway, now: i64) !void {
@@ -745,7 +789,9 @@ pub const Gateway = struct {
             .last_ack_progress_ns = 0,
             .prev_largest_acked = 0,
             .has_prev_largest_acked = false,
-            .loss_detection_timer = 0,
+            .loss_time = 0,
+            .pto_time = 0,
+            .pto_count = 0,
             .config = .{},
             .running = true,
             .last_ack_send_ns = now,
@@ -902,9 +948,11 @@ test "integration: BBR paced output delivery with simulated loss" {
             gw.forwardDaemonMessage(msg.header.tag, msg.payload, now) catch {};
         }
 
-        // Loss detection timer
-        if (gw.loss_detection_timer > 0 and now >= gw.loss_detection_timer) {
-            gw.runLossDetection(now);
+        // Loss/PTO timer
+        if (gw.loss_time > 0 and now >= gw.loss_time) {
+            gw.onLossDetectionTimeout(now);
+        } else if (gw.pto_time > 0 and now >= gw.pto_time) {
+            gw.onPtoTimeout(now);
         }
 
         // Send paced output
