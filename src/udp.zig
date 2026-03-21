@@ -261,7 +261,7 @@ pub const Peer = struct {
     }
 
     /// Update RTT estimate (RFC 6298, 50ms min RTO).
-    fn updateRtt(self: *Peer, rtt_us: i64) void {
+    pub fn updateRtt(self: *Peer, rtt_us: i64) void {
         if (self.srtt_us) |srtt| {
             const rttvar = self.rttvar_us orelse 0;
             const diff = if (srtt > rtt_us) srtt - rtt_us else rtt_us - srtt;

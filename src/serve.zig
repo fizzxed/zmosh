@@ -4,6 +4,8 @@ const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
+const congestion = @import("congestion.zig");
+const loss = @import("loss.zig");
 
 const log = std.log.scoped(.serve);
 
@@ -58,16 +60,24 @@ pub const Gateway = struct {
     peer: udp.Peer,
     unix_read_buf: ipc.SocketBuffer,
     unix_write_buf: std.ArrayList(u8),
-    output_coalesce_buf: std.ArrayList(u8),
+    pending_output: std.ArrayList(u8),
 
     reliable_send: transport.ReliableSend,
     reliable_recv: transport.RecvState,
     output_seq: u32,
 
+    // BBR congestion control + pacing
+    bbr: congestion.Bbr,
+    pacer: congestion.Pacer,
+    send_buf: loss.SendBuffer,
+    loss_detector: loss.LossDetector,
+    retransmit_buf: [64]u32,
+    retransmit_queue: std.ArrayListUnmanaged(u32),
+    latest_rtt_ns: i64,
+
     config: udp.Config,
     running: bool,
 
-    last_output_flush_ns: i64,
     last_ack_send_ns: i64,
     ack_dirty: bool,
 
@@ -126,33 +136,42 @@ pub const Gateway = struct {
 
         const unix_read_buf = try ipc.SocketBuffer.init(alloc);
         const unix_write_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
-        const output_coalesce_buf = try std.ArrayList(u8).initCapacity(alloc, 4096);
+        const pending_output = try std.ArrayList(u8).initCapacity(alloc, 4096);
         const reliable_send = try transport.ReliableSend.init(alloc);
+        const send_buf = try loss.SendBuffer.init(alloc);
 
         const now: i64 = @intCast(std.time.nanoTimestamp());
 
         log.info("gateway started session={s} udp_port={d}", .{ session_name, udp_sock.bound_port });
 
-        return .{
+        var gw = Gateway{
             .alloc = alloc,
             .udp_sock = udp_sock,
             .unix_fd = unix_fd,
             .peer = peer,
             .unix_read_buf = unix_read_buf,
             .unix_write_buf = unix_write_buf,
-            .output_coalesce_buf = output_coalesce_buf,
+            .pending_output = pending_output,
             .reliable_send = reliable_send,
             .reliable_recv = .{},
             .output_seq = 1,
+            .bbr = .{},
+            .pacer = .{},
+            .send_buf = send_buf,
+            .loss_detector = .{},
+            .retransmit_buf = undefined,
+            .retransmit_queue = undefined,
+            .latest_rtt_ns = 0,
             .config = config,
             .running = true,
-            .last_output_flush_ns = now,
             .last_ack_send_ns = now,
             .ack_dirty = false,
             .last_resync_request_ns = 0,
             .have_client_size = false,
             .last_resize = .{ .rows = 24, .cols = 80 },
         };
+        gw.retransmit_queue = std.ArrayListUnmanaged(u32).initBuffer(&gw.retransmit_buf);
+        return gw;
     }
 
     pub fn run(self: *Gateway) !void {
@@ -174,7 +193,7 @@ pub const Gateway = struct {
             }
 
             try self.flushRetransmits(now);
-            try self.flushOutput(now, false);
+            try self.sendPacedOutput(now);
 
             if (self.peer.addr != null) {
                 if (self.ack_dirty and (now - self.last_ack_send_ns >= ack_delay_ns)) {
@@ -268,11 +287,12 @@ pub const Gateway = struct {
     fn computePollTimeoutMs(self: *const Gateway, now: i64) i32 {
         var timeout: i64 = @min(@as(i64, self.config.heartbeat_interval_ms), 1000);
 
-        if (self.output_coalesce_buf.items.len > 0) {
-            const flush_due = self.last_output_flush_ns + self.outputFlushIntervalNs();
-            const remaining_ns = flush_due - now;
-            const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
-            timeout = @min(timeout, remaining_ms);
+        // Pacer timeout for pending output
+        if (self.pending_output.items.len > 0 or self.retransmit_queue.items.len > 0) {
+            if (self.bbr.canSend()) {
+                const pacer_ms = self.pacer.pollTimeoutMs(now);
+                timeout = @min(timeout, @as(i64, pacer_ms));
+            }
         }
 
         if (self.reliable_send.hasPending()) {
@@ -283,12 +303,6 @@ pub const Gateway = struct {
         if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
 
         return @intCast(@max(@as(i64, 0), timeout));
-    }
-
-    fn outputFlushIntervalNs(self: *const Gateway) i64 {
-        const srtt_us = self.peer.srtt_us orelse 32_000;
-        const paced_us = std.math.clamp(@divFloor(srtt_us, 8), @as(i64, 2_000), @as(i64, 8_000));
-        return paced_us * std.time.ns_per_us;
     }
 
     fn sendHeartbeat(self: *Gateway, now: i64) !void {
@@ -306,6 +320,145 @@ pub const Gateway = struct {
         self.ack_dirty = false;
     }
 
+    fn sendPacedOutput(self: *Gateway, now: i64) !void {
+        if (self.peer.addr == null) {
+            self.pending_output.clearRetainingCapacity();
+            return;
+        }
+
+        while (self.bbr.canSend() and self.pacer.canSend(now)) {
+            // Priority 1: retransmissions
+            if (self.retransmit_queue.items.len > 0) {
+                const seq = self.retransmit_queue.orderedRemove(0);
+                const entry = self.send_buf.getForRetransmit(seq) orelse continue;
+                const payload = self.send_buf.getPayload(seq) orelse continue;
+
+                var pkt_buf: [1200]u8 = undefined;
+                const pkt = try transport.buildUnreliable(
+                    .output,
+                    seq,
+                    self.reliable_recv.ack(),
+                    self.reliable_recv.ackBits(),
+                    payload,
+                    &pkt_buf,
+                );
+
+                self.peer.send(&self.udp_sock, pkt) catch |err| {
+                    if (err == error.WouldBlock) {
+                        // Put it back
+                        self.retransmit_queue.insertBounded(0, seq) catch {};
+                        return;
+                    }
+                    if (err == error.NoPeerAddress) return;
+                    return err;
+                };
+
+                entry.retransmit_count +|= 1;
+                entry.sent_time = now;
+                self.pacer.onSend(now, @intCast(payload.len), self.bbr.pacing_rate);
+                continue;
+            }
+
+            // Priority 2: new data from pending_output
+            if (self.pending_output.items.len == 0) break;
+
+            const end = @min(transport.max_payload_len, self.pending_output.items.len);
+            const chunk = self.pending_output.items[0..end];
+            const seq = self.output_seq;
+
+            // Record in send buffer with delivery state for BBR
+            const ds = self.bbr.getDeliveryState();
+            self.send_buf.recordSend(seq, chunk, now, ds);
+
+            var pkt_buf: [1200]u8 = undefined;
+            const pkt = try transport.buildUnreliable(
+                .output,
+                seq,
+                self.reliable_recv.ack(),
+                self.reliable_recv.ackBits(),
+                chunk,
+                &pkt_buf,
+            );
+
+            self.peer.send(&self.udp_sock, pkt) catch |err| {
+                if (err == error.WouldBlock) return;
+                if (err == error.NoPeerAddress) {
+                    self.pending_output.clearRetainingCapacity();
+                    return;
+                }
+                return err;
+            };
+
+            self.bbr.onSend(@intCast(chunk.len), now);
+            self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate);
+            self.output_seq +%= 1;
+
+            // Remove sent data from pending buffer
+            self.pending_output.replaceRange(self.alloc, 0, end, &[_]u8{}) catch unreachable;
+        }
+
+        // If both queues are empty, mark app-limited
+        if (self.pending_output.items.len == 0 and self.retransmit_queue.items.len == 0) {
+            self.bbr.setAppLimited();
+        }
+    }
+
+    fn processOutputAcks(self: *Gateway, payload: []const u8, now: i64) void {
+        var gap_buf: [loss.AckRanges.max_gaps]loss.AckRanges.Gap = undefined;
+        const ranges = loss.AckRanges.decode(payload, &gap_buf) catch return;
+
+        self.loss_detector.onAck(ranges.largest_acked);
+
+        // Process ACKed seqs
+        const Ctx = struct {
+            gw: *Gateway,
+            now_ns: i64,
+        };
+        const ctx = Ctx{ .gw = self, .now_ns = now };
+        const Handler = struct {
+            ctx_inner: Ctx,
+
+            pub fn call(handler: @This(), seq: u32) void {
+                const gw = handler.ctx_inner.gw;
+                const n = handler.ctx_inner.now_ns;
+                const entry = gw.send_buf.markAcked(seq) orelse return;
+
+                // RTT: Karn's algorithm — only use non-retransmitted packets
+                if (entry.retransmit_count == 0) {
+                    const rtt_ns = n - entry.sent_time;
+                    if (rtt_ns > 0) {
+                        gw.latest_rtt_ns = rtt_ns;
+                        gw.peer.updateRtt(@divFloor(rtt_ns, std.time.ns_per_us));
+                    }
+                }
+
+                // BBR delivery rate update
+                gw.bbr.onAck(.{
+                    .size = entry.size,
+                    .sent_time = entry.sent_time,
+                    .delivery_state = entry.delivery_state,
+                    .rtt_ns = if (entry.retransmit_count == 0) n - entry.sent_time else 0,
+                }, n);
+            }
+        };
+
+        ranges.iterateAcked(Handler{ .ctx_inner = ctx });
+
+        // Loss detection
+        const srtt_ns: i64 = if (self.peer.srtt_us) |s| s * std.time.ns_per_us else 100 * std.time.ns_per_ms;
+        const latest = if (self.latest_rtt_ns > 0) self.latest_rtt_ns else srtt_ns;
+        self.loss_detector.detectLosses(&self.send_buf, now, srtt_ns, latest, &self.retransmit_queue);
+
+        // Notify BBR about losses (peek, don't remove — retransmitted by sendPacedOutput)
+        for (self.retransmit_queue.items) |lost_seq| {
+            if (self.send_buf.getForRetransmit(lost_seq)) |entry| {
+                self.bbr.onLoss(entry.size, entry.delivery_state.tx_in_flight);
+            }
+        }
+
+        self.send_buf.pruneAcked();
+    }
+
     fn flushRetransmits(self: *Gateway, now: i64) !void {
         var packets = try self.reliable_send.collectRetransmits(self.alloc, now, self.peer.rto_us());
         defer packets.deinit(self.alloc);
@@ -318,55 +471,6 @@ pub const Gateway = struct {
         }
     }
 
-    fn flushOutput(self: *Gateway, now: i64, force: bool) !void {
-        if (self.output_coalesce_buf.items.len == 0) return;
-        if (!force and (now - self.last_output_flush_ns) < self.outputFlushIntervalNs()) return;
-
-        if (self.peer.addr == null) {
-            self.output_coalesce_buf.clearRetainingCapacity();
-            self.last_output_flush_ns = now;
-            return;
-        }
-
-        var sent_off: usize = 0;
-        while (sent_off < self.output_coalesce_buf.items.len) {
-            const end = @min(sent_off + transport.max_payload_len, self.output_coalesce_buf.items.len);
-            const chunk = self.output_coalesce_buf.items[sent_off..end];
-
-            var pkt_buf: [1200]u8 = undefined;
-            const pkt = try transport.buildUnreliable(
-                .output,
-                self.output_seq,
-                self.reliable_recv.ack(),
-                self.reliable_recv.ackBits(),
-                chunk,
-                &pkt_buf,
-            );
-
-            self.peer.send(&self.udp_sock, pkt) catch |err| {
-                if (err == error.WouldBlock) {
-                    // Retain unsent data for next flush cycle
-                    log.debug("udp WouldBlock; retaining {d} unsent bytes", .{self.output_coalesce_buf.items.len - sent_off});
-                    break;
-                }
-                if (err == error.NoPeerAddress) {
-                    self.output_coalesce_buf.clearRetainingCapacity();
-                    self.last_output_flush_ns = now;
-                    return;
-                }
-                return err;
-            };
-
-            self.output_seq +%= 1;
-            sent_off = end;
-        }
-
-        if (sent_off > 0) {
-            self.output_coalesce_buf.replaceRange(self.alloc, 0, sent_off, &[_]u8{}) catch unreachable;
-        }
-
-        self.last_output_flush_ns = now;
-    }
 
     fn trackClientResize(self: *Gateway, payload: []const u8) void {
         var offset: usize = 0;
@@ -413,7 +517,11 @@ pub const Gateway = struct {
         self.reliable_send.ack(packet.ack, packet.ack_bits);
 
         switch (packet.channel) {
-            .heartbeat => {},
+            .heartbeat => {
+                if (packet.payload.len > 0) {
+                    self.processOutputAcks(packet.payload, now);
+                }
+            },
             .output => {
                 // Client never sends output channel packets.
             },
@@ -476,20 +584,16 @@ pub const Gateway = struct {
 
     fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
         if (tag == .Output) {
-            if (self.output_coalesce_buf.items.len + payload.len > max_output_coalesce) {
-                log.debug("output coalesce overflow buf={d} payload={d}; requesting snapshot", .{ self.output_coalesce_buf.items.len, payload.len });
-                self.output_coalesce_buf.clearRetainingCapacity();
+            if (self.pending_output.items.len + payload.len > max_output_coalesce) {
+                log.debug("output pending overflow buf={d} payload={d}; requesting snapshot", .{ self.pending_output.items.len, payload.len });
+                self.pending_output.clearRetainingCapacity();
                 try self.requestSnapshot(now);
                 return;
             }
-            try self.output_coalesce_buf.appendSlice(self.alloc, payload);
-            if (self.output_coalesce_buf.items.len >= transport.max_payload_len * 4) {
-                try self.flushOutput(now, true);
-            }
+            try self.pending_output.appendSlice(self.alloc, payload);
             return;
         }
 
-        try self.flushOutput(now, true);
         try self.sendIpcReliable(tag, payload, now);
     }
 
@@ -498,7 +602,8 @@ pub const Gateway = struct {
         self.udp_sock.close();
         self.unix_read_buf.deinit();
         self.unix_write_buf.deinit(self.alloc);
-        self.output_coalesce_buf.deinit(self.alloc);
+        self.pending_output.deinit(self.alloc);
+        self.send_buf.deinit(self.alloc);
         self.reliable_send.deinit();
     }
 };

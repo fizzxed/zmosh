@@ -4,6 +4,7 @@ const crypto = @import("crypto.zig");
 const udp_mod = @import("udp.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
+const loss = @import("loss.zig");
 const builtin = @import("builtin");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
@@ -166,17 +167,28 @@ fn sendHeartbeat(
     peer: *udp_mod.Peer,
     sock: *udp_mod.UdpSocket,
     reliable_recv: *const transport.RecvState,
+    output_ack_tracker: *const loss.OutputAckTracker,
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     now: i64,
 ) !void {
+    // Encode output ACK ranges as heartbeat payload
+    var gap_buf: [loss.AckRanges.max_gaps]loss.AckRanges.Gap = undefined;
+    const ranges = output_ack_tracker.generateAckRanges(&gap_buf);
+
+    var ack_payload_buf: [128]u8 = undefined;
+    const ack_payload = if (output_ack_tracker.has_received)
+        ranges.encode(&ack_payload_buf) catch ""
+    else
+        "";
+
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
         .heartbeat,
         0,
         reliable_recv.ack(),
         reliable_recv.ackBits(),
-        "",
+        ack_payload,
         &pkt_buf,
     );
     try peer.send(sock, pkt);
@@ -282,6 +294,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     defer reliable_send.deinit();
     var reliable_recv = transport.RecvState{};
     var output_recv = transport.OutputRecvState{};
+    var output_ack_tracker = loss.OutputAckTracker{};
 
     const debug_log: ?std.fs.File = std.fs.createFileAbsolute("/tmp/zmosh-debug.log", .{ .truncate = true }) catch null;
     defer if (debug_log) |f| f.close();
@@ -366,9 +379,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
         // Ack heartbeat + keepalive heartbeat.
         if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &last_ack_send_ns, &ack_dirty, now) catch {};
         } else if (peer.shouldSendHeartbeat(now, config)) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &last_ack_send_ns, &ack_dirty, now) catch {};
         }
 
         // State check
@@ -473,9 +486,15 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                     .output => {
                         switch (output_recv.onPacket(packet.seq, packet.payload)) {
                             .delivered => {
+                                output_ack_tracker.onRecv(packet.seq);
+                                ack_dirty = true;
                                 const deliveries = output_recv.deliverSlice();
                                 if (deliveries.len() > 1) {
                                     debugWrite(debug_log, "REORDER_RECOVERY count={d}\n", .{deliveries.len()});
+                                    // Track ACKs for all delivered buffered packets too
+                                    for (1..deliveries.len()) |di| {
+                                        output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)));
+                                    }
                                 }
                                 for (0..deliveries.len()) |i| {
                                     const p = deliveries.get(i);
@@ -489,9 +508,14 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                     try stdout_buf.appendSlice(alloc, p);
                                 }
                             },
-                            .buffered => {},
+                            .buffered => {
+                                output_ack_tracker.onRecv(packet.seq);
+                                ack_dirty = true;
+                            },
                             .gap_resync => {
-                                debugWrite(debug_log, "GAP_RESYNC seq={d} expected={d}\n", .{ packet.seq, output_recv.expected });
+                                debugWrite(debug_log, "GAP_RESYNC seq={d} new_expected={d} (window={d})\n", .{ packet.seq, output_recv.expected, transport.OutputRecvState.window_size });
+                                output_ack_tracker = .{};
+                                ack_dirty = true;
                                 stdout_buf.clearRetainingCapacity();
                                 try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
                             },

@@ -1,7 +1,7 @@
 const std = @import("std");
 const ipc = @import("ipc.zig");
 
-pub const version: u8 = 1;
+pub const version: u8 = 2;
 pub const max_payload_len: usize = 1100;
 const header_len: usize = 20;
 
@@ -83,7 +83,7 @@ pub const RecvState = struct {
 };
 
 pub const OutputRecvState = struct {
-    pub const window_size = 32;
+    pub const window_size = 256;
 
     expected: u32 = 0,
     has_expected: bool = false,
@@ -427,8 +427,8 @@ test "output no false gap on reorder" {
 test "output true gap beyond window" {
     var out = OutputRecvState{};
     try std.testing.expect(out.onPacket(1, "a") == .delivered);
-    // Seq 50 is 48 away from expected=2, which is >= window_size (32)
-    try std.testing.expect(out.onPacket(50, "z") == .gap_resync);
+    // Seq 300 is 298 away from expected=2, which is >= window_size (256)
+    try std.testing.expect(out.onPacket(300, "z") == .gap_resync);
 }
 
 test "output duplicate detection with reorder buffer" {

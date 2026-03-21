@@ -4,6 +4,7 @@ const crypto = @import("crypto.zig");
 const udp_mod = @import("udp.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
+const loss = @import("loss.zig");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_input_len = 1024 * 1024;
@@ -61,6 +62,7 @@ const Session = struct {
     reliable_send: transport.ReliableSend,
     reliable_recv: transport.RecvState,
     output_recv: transport.OutputRecvState,
+    output_ack_tracker: loss.OutputAckTracker,
 
     last_ack_send_ns: i64,
     ack_dirty: bool,
@@ -80,13 +82,23 @@ const Session = struct {
 // ---------------------------------------------------------------------------
 
 fn sendHeartbeat(s: *Session, now: i64) !void {
+    // Encode output ACK ranges as heartbeat payload
+    var gap_buf: [loss.AckRanges.max_gaps]loss.AckRanges.Gap = undefined;
+    const ranges = s.output_ack_tracker.generateAckRanges(&gap_buf);
+
+    var ack_payload_buf: [128]u8 = undefined;
+    const ack_payload = if (s.output_ack_tracker.has_received)
+        ranges.encode(&ack_payload_buf) catch ""
+    else
+        "";
+
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
         .heartbeat,
         0,
         s.reliable_recv.ack(),
         s.reliable_recv.ackBits(),
-        "",
+        ack_payload,
         &pkt_buf,
     );
     try s.peer.send(&s.udp_sock, pkt);
@@ -242,6 +254,7 @@ export fn zmosh_connect(
         .reliable_send = reliable_send,
         .reliable_recv = .{},
         .output_recv = .{},
+        .output_ack_tracker = .{},
         .last_ack_send_ns = now,
         .ack_dirty = false,
         .last_resync_request_ns = 0,
@@ -340,7 +353,13 @@ export fn zmosh_poll(session: ?*Session) Status {
             .output => {
                 switch (s.output_recv.onPacket(packet.seq, packet.payload)) {
                     .delivered => {
+                        s.output_ack_tracker.onRecv(packet.seq);
+                        s.ack_dirty = true;
                         const deliveries = s.output_recv.deliverSlice();
+                        // Track ACKs for buffered packets delivered in batch
+                        for (1..deliveries.len()) |di| {
+                            s.output_ack_tracker.onRecv(s.output_recv.deliver_start +% @as(u32, @intCast(di)));
+                        }
                         for (0..deliveries.len()) |i| {
                             const p = deliveries.get(i);
                             if (p.len > 0) {
@@ -348,8 +367,13 @@ export fn zmosh_poll(session: ?*Session) Status {
                             }
                         }
                     },
-                    .buffered => {},
+                    .buffered => {
+                        s.output_ack_tracker.onRecv(packet.seq);
+                        s.ack_dirty = true;
+                    },
                     .gap_resync => {
+                        s.output_ack_tracker = .{};
+                        s.ack_dirty = true;
                         requestResync(s, now) catch {};
                     },
                     .duplicate, .stale => {},
