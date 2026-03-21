@@ -35,12 +35,24 @@ pub const UdpSocket = struct {
         return error.AddressInUse;
     }
 
+    /// Target UDP socket buffer size (2 MB). Large enough to absorb burst
+    /// sends from BBR without kernel-level drops. The kernel may cap this
+    /// at rmem_max/wmem_max; setsockopt silently clamps.
+    const target_buf_size = 2 * 1024 * 1024;
+
+    pub fn setSocketBuffers(fd: posix.fd_t) void {
+        const size: i32 = target_buf_size;
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&size)) catch {};
+    }
+
     fn bindFamily(family: u32, port_start: u16, port_end: u16, set_v6only: bool) ?UdpSocket {
         const fd = posix.socket(
             family,
             posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
             0,
         ) catch return null;
+        setSocketBuffers(fd);
 
         if (set_v6only) {
             const v6only: i32 = 0;

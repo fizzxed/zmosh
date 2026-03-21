@@ -212,6 +212,7 @@ export fn zmosh_connect(
         set_status(status, .err_socket);
         return null;
     };
+    udp_mod.UdpSocket.setSocketBuffers(sock_fd);
     var udp_sock = udp_mod.UdpSocket{ .fd = sock_fd, .bound_port = 0 };
 
     // Init peer

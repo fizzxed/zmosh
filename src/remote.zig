@@ -296,6 +296,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC,
         0,
     );
+    udp_mod.UdpSocket.setSocketBuffers(sock_fd);
     var udp_sock = udp_mod.UdpSocket{ .fd = sock_fd, .bound_port = 0 };
     defer udp_sock.close();
 
