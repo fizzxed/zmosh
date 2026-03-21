@@ -555,9 +555,16 @@ pub const Bbr = struct {
             return; // wait until end of round trip
 
         self.adaptLowerBoundsFromCongestion();
+
+        // Check startup high loss BEFORE resetting per-round counters.
+        // checkStartupHighLoss reads loss_in_round, bytes_lost_in_round,
+        // and startup_loss_events which get cleared below.
+        self.checkStartupHighLoss(rs);
+
         self.loss_in_round = false;
         self.startup_loss_events = 0;
         self.bytes_lost_in_round = 0;
+        self.has_last_startup_lost = false;
     }
 
     fn updateMaxBw(self: *Bbr, rs: RateSample) void {
@@ -664,7 +671,9 @@ pub const Bbr = struct {
     }
 
     fn checkStartupDone(self: *Bbr, rs: RateSample) void {
-        self.checkStartupHighLoss(rs);
+        // Note: checkStartupHighLoss is called from updateCongestionSignals
+        // BEFORE per-round counters are reset, so it can read loss_in_round etc.
+        _ = rs;
         if (self.state == .startup and self.full_bw_reached) {
             self.enterDrain();
         }

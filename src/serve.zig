@@ -377,6 +377,8 @@ pub const Gateway = struct {
 
                 entry.retransmit_count +|= 1;
                 entry.sent_time = now;
+                // Re-increment inflight: onLoss decremented it, retransmit puts it back
+                self.bbr.inflight +|= @as(u32, @intCast(payload.len));
                 self.pacer.onSend(now, @intCast(payload.len), self.bbr.pacing_rate);
                 continue;
             }
