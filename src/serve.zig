@@ -440,7 +440,10 @@ pub const Gateway = struct {
 
             entry.retransmit_count +|= 1;
             entry.sent_time = now;
-            self.bbr.inflight +|= @as(u32, @intCast(rtx_payload.len));
+            // Do NOT increment inflight for retransmits. onLoss already
+            // decremented it. Re-incrementing causes drift: if markAcked
+            // returns null (already acked from original), onAckPacket
+            // won't decrement, and inflight grows unboundedly.
             self.pacer.onSend(now, @intCast(rtx_payload.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
         }
 

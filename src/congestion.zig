@@ -512,7 +512,7 @@ pub const Bbr = struct {
     }
 
     pub fn canSend(self: *const Bbr) bool {
-        return self.inflight < self.cwnd or self.inflight < min_cwnd;
+        return self.inflight < self.cwnd;
     }
 
     pub fn setAppLimited(self: *Bbr) void {
