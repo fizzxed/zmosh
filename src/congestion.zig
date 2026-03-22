@@ -102,16 +102,6 @@ pub const MaxFilter = struct {
 // Delivery Rate Estimation
 // ---------------------------------------------------------------------------
 
-/// A0 reference point for ACK-rate computation (overestimate avoidance).
-/// Saved at ACK aggregation epoch boundaries to provide a stable baseline
-/// for ack_rate that spans the full epoch, preventing burst compression
-/// from inflating bandwidth estimates. (Google/Cloudflare bandwidth sampler)
-const AckPoint = struct {
-    ack_time: i64,
-    total_bytes_acked: u64,
-};
-const a0_capacity = 8;
-
 pub const DeliveryState = struct {
     delivered: u64 = 0,
     delivered_time: i64 = 0,
@@ -119,10 +109,6 @@ pub const DeliveryState = struct {
     is_app_limited: bool = false,
     tx_in_flight: u32 = 0,
     lost: u64 = 0, // C.lost at time of send (for RS.lost = C.lost - P.lost)
-    // Google/Cloudflare bandwidth sampler: per-packet snapshots
-    total_bytes_sent: u64 = 0, // cumulative bytes sent when this packet was sent
-    total_bytes_sent_at_last_acked: u64 = 0, // total_bytes_sent when last-acked pkt was sent
-    last_acked_pkt_sent_time: i64 = 0, // sent_time of the most recently acked packet
 };
 
 pub const RateSample = struct {
@@ -239,15 +225,6 @@ pub const Bbr = struct {
     delivered_time: i64 = 0,
     first_sent_time: i64 = 0,
     total_lost: u64 = 0, // C.lost: cumulative bytes declared lost
-    total_bytes_sent: u64 = 0, // cumulative bytes sent
-
-    // --- Google/Cloudflare bandwidth sampler state ---
-    total_bytes_sent_at_last_acked: u64 = 0, // total_bytes_sent when last-acked pkt was sent
-    last_acked_pkt_sent_time: i64 = 0, // sent_time of the most recently acked packet
-
-    // --- A0 point candidates (overestimate avoidance) ---
-    a0_candidates: [a0_capacity]AckPoint = [1]AckPoint{.{ .ack_time = 0, .total_bytes_acked = 0 }} ** a0_capacity,
-    a0_count: u32 = 0,
 
     // --- Round tracking ---
     round_count: u64 = 0,
@@ -330,9 +307,8 @@ pub const Bbr = struct {
             self.delivered_time = now;
         }
 
-        // Update inflight and cumulative sent BEFORE snapshot
+        // Update inflight BEFORE snapshot
         self.inflight += bytes;
-        self.total_bytes_sent += bytes;
 
         // Snapshot delivery state (spec: P.delivered_time = C.delivered_time, etc.)
         const ds = DeliveryState{
@@ -342,9 +318,6 @@ pub const Bbr = struct {
             .is_app_limited = self.is_app_limited,
             .tx_in_flight = self.inflight,
             .lost = self.total_lost,
-            .total_bytes_sent = self.total_bytes_sent,
-            .total_bytes_sent_at_last_acked = self.total_bytes_sent_at_last_acked,
-            .last_acked_pkt_sent_time = self.last_acked_pkt_sent_time,
         };
 
         // Spec §4.1.2.2: C.first_send_time = P.send_time (for next packet)
@@ -412,11 +385,6 @@ pub const Bbr = struct {
 
         var rs = self.computeRateSample(best_pkt, now);
         rs.newly_acked = self.pending_ack_newly_acked;
-
-        // Update "last acked" state for future packets' send_rate.
-        // best_pkt is the most recently sent packet in this ACK event.
-        self.total_bytes_sent_at_last_acked = best_pkt.delivery_state.total_bytes_sent;
-        self.last_acked_pkt_sent_time = best_pkt.sent_time;
 
         // --- BBRUpdateModelAndState ---
         // BBRUpdateLatestDeliverySignals (spec 5.5.10.3)
@@ -578,35 +546,6 @@ pub const Bbr = struct {
         };
     }
 
-    /// Select the A0 candidate whose total_bytes_acked is closest to (but not
-    /// exceeding) the target. This gives the widest valid ACK measurement
-    /// baseline for the packet that was sent when C.delivered == target.
-    fn selectA0(self: *const Bbr, target_bytes_acked: u64) ?AckPoint {
-        var best: ?AckPoint = null;
-        for (self.a0_candidates[0..self.a0_count]) |candidate| {
-            if (candidate.total_bytes_acked <= target_bytes_acked) {
-                if (best == null or candidate.total_bytes_acked > best.?.total_bytes_acked) {
-                    best = candidate;
-                }
-            }
-        }
-        return best;
-    }
-
-    /// Push an A0 candidate at an ACK aggregation epoch boundary.
-    fn pushA0Candidate(self: *Bbr, point: AckPoint) void {
-        if (self.a0_count < a0_capacity) {
-            self.a0_candidates[self.a0_count] = point;
-            self.a0_count += 1;
-        } else {
-            // Shift left, drop oldest
-            for (0..a0_capacity - 1) |i| {
-                self.a0_candidates[i] = self.a0_candidates[i + 1];
-            }
-            self.a0_candidates[a0_capacity - 1] = point;
-        }
-    }
-
     // ------------------------------------------------------------------
     // Internal: Round counting (spec 5.5.1)
     // ------------------------------------------------------------------
@@ -761,8 +700,6 @@ pub const Bbr = struct {
             self.extra_acked_delivered = 0;
             self.extra_acked_interval_start = now;
             expected_delivered = 0;
-            // Save A0 candidate at epoch boundary (overestimate avoidance)
-            self.pushA0Candidate(.{ .ack_time = now, .total_bytes_acked = self.delivered });
         }
         self.extra_acked_delivered += rs.newly_acked;
 
@@ -1470,22 +1407,15 @@ test "Bbr initial state" {
     try std.testing.expectEqual(@as(u32, max_u32), bbr.inflight_longterm);
 }
 
-test "Bbr onSend tracks inflight, total_bytes_sent, and sampler state" {
+test "Bbr onSend tracks inflight" {
     var bbr = Bbr{};
     const now: i64 = 1_000_000_000;
 
-    const ds1 = bbr.onSend(1200, now);
+    _ = bbr.onSend(1200, now);
     try std.testing.expectEqual(@as(u32, 1200), bbr.inflight);
-    try std.testing.expectEqual(@as(u64, 1200), bbr.total_bytes_sent);
-    try std.testing.expectEqual(@as(u64, 1200), ds1.total_bytes_sent);
-    // Before any ack, last_acked fields are 0
-    try std.testing.expectEqual(@as(u64, 0), ds1.total_bytes_sent_at_last_acked);
-    try std.testing.expectEqual(@as(i64, 0), ds1.last_acked_pkt_sent_time);
 
-    const ds2 = bbr.onSend(1200, now + 1000);
+    _ = bbr.onSend(1200, now + 1000);
     try std.testing.expectEqual(@as(u32, 2400), bbr.inflight);
-    try std.testing.expectEqual(@as(u64, 2400), bbr.total_bytes_sent);
-    try std.testing.expectEqual(@as(u64, 2400), ds2.total_bytes_sent);
 }
 
 test "Bbr onAck updates delivery and max_bw" {
@@ -1642,16 +1572,11 @@ test "rate sampling: burst send, ack_rate wins via min" {
     // Simulate ACK arriving at T+50ms
     bbr.delivered = 12000;
     bbr.delivered_time = base + 50 * std.time.ns_per_ms;
-    bbr.total_bytes_sent = 12000;
 
     const ds = DeliveryState{
         .delivered = 0,
         .delivered_time = base,
         .first_sent_time = base,
-        .total_bytes_sent = 0,
-        // No prior ack: send_rate invalid, ack_rate carries the sample
-        .total_bytes_sent_at_last_acked = 0,
-        .last_acked_pkt_sent_time = 0,
     };
     const rs = bbr.computeRateSample(.{
         .size = 1200,
@@ -1660,9 +1585,9 @@ test "rate sampling: burst send, ack_rate wins via min" {
         .rtt_ns = 50 * std.time.ns_per_ms,
     }, base + 50 * std.time.ns_per_ms);
 
-    // send_rate: invalid (last_acked_pkt_sent_time = 0) → max_u64
-    // ack_rate: 12000 / 50ms = 240000 bytes/s
-    // min(max_u64, 240000) = 240000
+    // send_elapsed = 0 (burst), ack_elapsed = 50ms
+    // interval = max(0, 50ms) = 50ms
+    // rate = 12000 / 50ms = 240000 bytes/s
     try std.testing.expectEqual(@as(u64, 240_000), rs.delivery_rate);
 }
 
@@ -1692,43 +1617,6 @@ test "rate sampling: max interval caps short ack_elapsed" {
     // interval = max(25ms, 10ms) = 25ms
     // rate = 1200 / 25ms = 48000
     try std.testing.expectEqual(@as(u64, 48_000), rs.delivery_rate);
-}
-
-test "A0 point selection: closest match" {
-    var bbr = Bbr{};
-    const base: i64 = 1_000_000_000;
-
-    // Push A0 candidates at different delivered levels
-    bbr.pushA0Candidate(.{ .ack_time = base, .total_bytes_acked = 0 });
-    bbr.pushA0Candidate(.{ .ack_time = base + 10 * std.time.ns_per_ms, .total_bytes_acked = 5000 });
-    bbr.pushA0Candidate(.{ .ack_time = base + 20 * std.time.ns_per_ms, .total_bytes_acked = 10000 });
-
-    // Target 7000: should pick the candidate with 5000 (closest below)
-    const a0 = bbr.selectA0(7000);
-    try std.testing.expect(a0 != null);
-    try std.testing.expectEqual(@as(u64, 5000), a0.?.total_bytes_acked);
-
-    // Target 15000: should pick 10000
-    const a1 = bbr.selectA0(15000);
-    try std.testing.expect(a1 != null);
-    try std.testing.expectEqual(@as(u64, 10000), a1.?.total_bytes_acked);
-
-    // Target 0: only candidate with 0 qualifies
-    const a2 = bbr.selectA0(0);
-    try std.testing.expect(a2 != null);
-    try std.testing.expectEqual(@as(u64, 0), a2.?.total_bytes_acked);
-}
-
-test "A0 point deque eviction" {
-    var bbr = Bbr{};
-    // Push more than a0_capacity candidates
-    for (0..a0_capacity + 4) |i| {
-        bbr.pushA0Candidate(.{ .ack_time = @intCast(i * 1000), .total_bytes_acked = @intCast(i * 100) });
-    }
-    // Should have exactly a0_capacity entries
-    try std.testing.expectEqual(a0_capacity, bbr.a0_count);
-    // Oldest should have been evicted; first entry is from i=4
-    try std.testing.expectEqual(@as(u64, 400), bbr.a0_candidates[0].total_bytes_acked);
 }
 
 test "isInflightTooHigh" {
