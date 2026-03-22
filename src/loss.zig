@@ -121,7 +121,7 @@ pub const SendBuffer = struct {
         alloc.free(self.entries);
     }
 
-    pub fn idx(offset: u32) usize {
+    fn idx(offset: u32) usize {
         return (offset / transport.step) % capacity;
     }
 
@@ -219,8 +219,9 @@ pub const SendBuffer = struct {
 /// loss thresholds on very low RTT paths.
 const granularity_ns: i64 = std.time.ns_per_ms;
 
-/// Peer's max ACK delay. Must match ack_delay_ns in remote.zig/lib.zig.
+/// Peer's max ACK delay (client-side: remote.zig/lib.zig ack_delay_ns).
 /// Used in PTO calculation (RFC 9002 §6.2.1), NOT in loss detection.
+/// The server's own ack_delay (serve.zig) may differ.
 pub const max_ack_delay_ns: i64 = 5 * std.time.ns_per_ms;
 
 pub const LossDetector = struct {

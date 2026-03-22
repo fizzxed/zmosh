@@ -355,7 +355,7 @@ export fn zmosh_poll(session: ?*Session) Status {
 
                     if (hdr.tag == .Output and payload.len > 0) {
                         s.output_cb(s.ctx, payload.ptr, @intCast(payload.len));
-                    } else if (@intFromEnum(hdr.tag) == 11) { // SessionEnd
+                    } else if (@intFromEnum(hdr.tag) == ipc.Tag.session_end) {
                         s.session_ended = true;
                         if (s.end_cb) |cb| cb(s.ctx);
                         return .ok;

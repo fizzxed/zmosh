@@ -19,6 +19,10 @@ pub const Tag = enum(u8) {
     // @enumFromInt, so out-of-range values (11-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
     _,
+
+    /// SessionEnd tag (11) is sent by the gateway but not part of the
+    /// daemon's IPC protocol. Defined here to avoid magic numbers.
+    pub const session_end: u8 = 11;
 };
 
 pub const Header = packed struct {
