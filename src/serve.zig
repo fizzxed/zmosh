@@ -319,9 +319,13 @@ pub const Gateway = struct {
             }
             poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
 
-            const poll_timeout = self.computePollTimeoutMs(now);
-            _ = posix.poll(&poll_fds, poll_timeout) catch |err| {
-                if (err == error.Interrupted) continue;
+            const poll_timeout_ns = self.computePollTimeoutNs(now);
+            const ts = posix.timespec{
+                .sec = @intCast(@divFloor(poll_timeout_ns, std.time.ns_per_s)),
+                .nsec = @intCast(@mod(poll_timeout_ns, std.time.ns_per_s)),
+            };
+            _ = posix.ppoll(&poll_fds, &ts, null) catch |err| {
+                if (err == error.SignalInterrupt) continue;
                 return err;
             };
 
@@ -386,14 +390,14 @@ pub const Gateway = struct {
         }
     }
 
-    fn computePollTimeoutMs(self: *const Gateway, now: i64) i32 {
-        var timeout: i64 = @min(@as(i64, self.config.heartbeat_interval_ms), 1000);
+    fn computePollTimeoutNs(self: *const Gateway, now: i64) i64 {
+        var timeout: i64 = @min(@as(i64, self.config.heartbeat_interval_ms), 1000) * std.time.ns_per_ms;
 
-        // Pacer timeout for pending output
+        // Pacer timeout for pending output (nanosecond precision)
         if (self.pending_output.items.len > 0 or self.retransmit_queue.items.len > 0) {
             if (self.bbr.canSend()) {
-                const pacer_ms = self.pacer.pollTimeoutMs(now);
-                timeout = @min(timeout, @as(i64, pacer_ms));
+                const pacer_ns = self.pacer.pollTimeoutNs(now);
+                timeout = @min(timeout, pacer_ns);
             }
         }
 
@@ -401,18 +405,17 @@ pub const Gateway = struct {
         const timer = if (self.loss_time > 0) self.loss_time else if (self.pto_time > 0) self.pto_time else @as(i64, 0);
         if (timer > 0) {
             const remaining_ns = timer - now;
-            const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
-            timeout = @min(timeout, remaining_ms);
+            timeout = @min(timeout, if (remaining_ns > 0) remaining_ns else 0);
         }
 
         if (self.reliable_send.hasPending()) {
-            const rto_ms = @divFloor(self.peer.rto_us(), 1000);
-            timeout = @min(timeout, @max(@as(i64, 1), rto_ms));
+            const rto_ns = self.peer.rto_us() * std.time.ns_per_us;
+            timeout = @min(timeout, @max(@as(i64, 1000), rto_ns));
         }
 
-        if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
+        if (self.ack_dirty) timeout = @min(timeout, 20 * std.time.ns_per_ms);
 
-        return @intCast(@max(@as(i64, 0), timeout));
+        return @max(timeout, 0);
     }
 
     fn sendHeartbeat(self: *Gateway, now: i64) !void {
