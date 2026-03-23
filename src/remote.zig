@@ -173,6 +173,7 @@ fn sendHeartbeat(
     output_ack_tracker: *const loss.OutputAckTracker,
     output_recv: *const transport.OutputRecvState,
     stdout_buf_len: usize,
+    recv_cap: u32,
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     now: i64,
@@ -188,8 +189,7 @@ fn sendHeartbeat(
         "";
 
     // Append flow control max_offset after ACK ranges
-    const reorder_cap = @as(usize, transport.OutputRecvState.window_size) * @as(usize, transport.step);
-    const recv_window = @min(max_stdout_buf -| stdout_buf_len, reorder_cap);
+    const recv_window = @min(max_stdout_buf -| stdout_buf_len, recv_cap);
     const max_offset = output_recv.next_offset +% @as(u32, @intCast(@min(recv_window, std.math.maxInt(u32))));
 
     var hb_payload_buf: [256]u8 = undefined;
@@ -295,6 +295,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var udp_sock = udp_mod.UdpSocket{ .fd = sock_fd, .bound_port = 0 };
     defer udp_sock.close();
 
+    // Flow control cap: min of reorder buffer and actual kernel socket buffer.
+    // Both are fixed at socket creation time.
+    const reorder_cap = @as(u32, transport.OutputRecvState.window_size) * @as(u32, transport.step);
+    const recv_cap: u32 = @min(reorder_cap, udp_mod.UdpSocket.getRecvBufSize(sock_fd));
+
     // Create peer
     var peer = udp_mod.Peer.init(session.key, .to_server);
     peer.addr = addr;
@@ -370,9 +375,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
         // Ack heartbeat + keepalive heartbeat.
         if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &output_recv, stdout_buf.items.len, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &output_recv, stdout_buf.items.len, recv_cap, &last_ack_send_ns, &ack_dirty, now) catch {};
         } else if (peer.shouldSendHeartbeat(now, config)) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &output_recv, stdout_buf.items.len, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &output_recv, stdout_buf.items.len, recv_cap, &last_ack_send_ns, &ack_dirty, now) catch {};
         }
 
         // State check

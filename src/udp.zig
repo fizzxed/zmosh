@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const crypto = @import("crypto.zig");
 
@@ -44,6 +45,16 @@ pub const UdpSocket = struct {
         const size: i32 = target_buf_size;
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&size)) catch {};
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&size)) catch {};
+    }
+
+    /// Query the actual SO_RCVBUF the kernel granted. On Linux the returned
+    /// value is doubled (half is kernel overhead), so usable = raw / 2.
+    /// On other platforms the returned value is usable as-is.
+    pub fn getRecvBufSize(fd: posix.fd_t) u32 {
+        var raw: i32 = undefined;
+        posix.getsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&raw)) catch return target_buf_size;
+        const usable = if (builtin.os.tag == .linux) @divFloor(raw, 2) else raw;
+        return @intCast(@max(usable, 0));
     }
 
     fn bindFamily(family: u32, port_start: u16, port_end: u16, set_v6only: bool) ?UdpSocket {

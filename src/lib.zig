@@ -74,6 +74,8 @@ const Session = struct {
     end_cb: ?SessionEndFn,
     ctx: ?*anyopaque,
 
+    recv_cap: u32,
+
     last_state: udp_mod.PeerState,
     session_ended: bool,
 };
@@ -95,10 +97,8 @@ fn sendHeartbeat(s: *Session, now: i64) !void {
 
     // Append flow control max_offset after ACK ranges.
     // The C API delivers output immediately via callback (no stdout buffer),
-    // so recv_window is capped only by the reorder window.
-    const reorder_cap = @as(usize, transport.OutputRecvState.window_size) * @as(usize, transport.step);
-    const recv_window: u32 = @intCast(@min(reorder_cap, std.math.maxInt(u32)));
-    const max_offset = s.output_recv.next_offset +% recv_window;
+    // so recv_window is capped by recv_cap (min of reorder window and socket buffer).
+    const max_offset = s.output_recv.next_offset +% s.recv_cap;
 
     var hb_payload_buf: [256]u8 = undefined;
     @memcpy(hb_payload_buf[0..ack_payload.len], ack_payload);
@@ -272,6 +272,10 @@ export fn zmosh_connect(
         .last_ack_send_ns = now,
         .ack_dirty = false,
         .last_resync_request_ns = 0,
+        .recv_cap = blk: {
+            const reorder_cap = @as(u32, transport.OutputRecvState.window_size) * @as(u32, transport.step);
+            break :blk @min(reorder_cap, udp_mod.UdpSocket.getRecvBufSize(sock_fd));
+        },
         .output_cb = cb,
         .state_cb = state_cb,
         .end_cb = end_cb,

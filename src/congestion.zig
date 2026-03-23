@@ -11,12 +11,8 @@ const max_payload_len: u32 = transport.max_payload_len;
 
 pub const max_datagram_size: u32 = 1200; // C.SMSS
 pub const initial_cwnd: u32 = 10 * max_datagram_size; // 12,000
-/// Minimum cwnd floor. The spec's 4*SMSS (4800 bytes) is designed for
-/// bulk TCP transfers. Terminal traffic is bursty (image previews, screen
-/// updates) and needs a larger floor to avoid throttling bursts. 64KB
-/// ensures a 100KB image preview completes in ~30ms at 20ms RTT instead
-/// of ~400ms with the spec's 4800-byte floor.
-pub const min_cwnd: u32 = 64 * 1024;
+/// Minimum cwnd floor: 4*SMSS per BBR spec.
+pub const min_cwnd: u32 = 4 * max_datagram_size;
 
 /// MinRTTFilterLen = 10 seconds (spec section 2.13.1)
 const min_rtt_filter_len_ns: i64 = 10 * std.time.ns_per_s;
