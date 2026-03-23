@@ -103,7 +103,8 @@ fn sendHeartbeat(s: *Session, now: i64) !void {
     var hb_payload_buf: [256]u8 = undefined;
     @memcpy(hb_payload_buf[0..ack_payload.len], ack_payload);
     std.mem.writeInt(u32, hb_payload_buf[ack_payload.len..][0..4], max_offset, .big);
-    const hb_payload = hb_payload_buf[0 .. ack_payload.len + 4];
+    std.mem.writeInt(u32, hb_payload_buf[ack_payload.len + 4 ..][0..4], s.output_recv.next_offset, .big);
+    const hb_payload = hb_payload_buf[0 .. ack_payload.len + 8];
 
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(

@@ -529,10 +529,19 @@ pub const Gateway = struct {
         var gap_buf: [loss.AckRanges.max_gaps]loss.AckRanges.Gap = undefined;
         const ranges = loss.AckRanges.decode(payload, &gap_buf) catch return;
 
-        // Decode flow control max_offset appended after ACK ranges
+        // Decode flow control max_offset and cumulative ACK floor
         const ack_end = loss.AckRanges.header_size + ranges.gaps.len * 4;
         if (payload.len >= ack_end + 4) {
             self.client_max_offset = std.mem.readInt(u32, payload[ack_end..][0..4], .big);
+        }
+        // Cumulative ACK floor: everything below this offset has been delivered.
+        // Mark all send buffer entries below this as acked — this covers offsets
+        // that fell outside the 16-gap ACK range window after heavy loss.
+        var cumulative_ack: u32 = 0;
+        var has_cumulative = false;
+        if (payload.len >= ack_end + 8) {
+            cumulative_ack = std.mem.readInt(u32, payload[ack_end + 4 ..][0..4], .big);
+            has_cumulative = true;
         }
 
         self.loss_detector.onAck(ranges.largest_acked);
@@ -547,6 +556,37 @@ pub const Gateway = struct {
 
         // Begin batched ACK event (spec §5.2.3: BBRUpdateOnACK runs once)
         self.bbr.beginAck();
+
+        // Apply cumulative ACK floor: mark everything below it as acked.
+        // Only update BBR for entries that haven't been acked yet.
+        if (has_cumulative) {
+            var off = self.send_buf.head_offset;
+            while (off != self.send_buf.tail_offset) : (off +%= transport.step) {
+                // Stop once we've passed the cumulative floor
+                const dist = cumulative_ack -% off;
+                if (dist == 0 or dist >= 0x80000000) break;
+
+                const entry = self.send_buf.markAcked(off) orelse continue;
+                // Feed BBR with the acked packet info
+                self.bbr.onAckPacket(.{
+                    .size = entry.size,
+                    .sent_time = entry.sent_time,
+                    .delivery_state = entry.delivery_state,
+                    .rtt_ns = 0, // No RTT from cumulative ACK (unknown which packet)
+                }, entry.retransmit_count > 0);
+            }
+            // Clear retransmit queue entries below cumulative floor
+            var i: usize = 0;
+            while (i < self.retransmit_queue.items.len) {
+                const roff = self.retransmit_queue.items[i];
+                const dist = cumulative_ack -% roff;
+                if (dist > 0 and dist < 0x80000000) {
+                    _ = self.retransmit_queue.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
 
         // Track whether any packet in the retransmit queue was ACKed (spurious loss)
         var spurious_detected = false;

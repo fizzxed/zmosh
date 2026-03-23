@@ -195,7 +195,11 @@ fn sendHeartbeat(
     var hb_payload_buf: [256]u8 = undefined;
     @memcpy(hb_payload_buf[0..ack_payload.len], ack_payload);
     std.mem.writeInt(u32, hb_payload_buf[ack_payload.len..][0..4], max_offset, .big);
-    const hb_payload = hb_payload_buf[0 .. ack_payload.len + 4];
+    // Cumulative ACK floor: everything below next_offset has been delivered.
+    // The server uses this to mark old send buffer entries as acked even when
+    // ACK ranges can't cover them (>16 gaps after heavy loss).
+    std.mem.writeInt(u32, hb_payload_buf[ack_payload.len + 4 ..][0..4], output_recv.next_offset, .big);
+    const hb_payload = hb_payload_buf[0 .. ack_payload.len + 8];
 
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
