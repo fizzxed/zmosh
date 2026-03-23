@@ -840,6 +840,14 @@ pub const Bbr = struct {
         self.probe_bw_phase = .cruise;
     }
 
+    /// Trigger an early bandwidth probe cycle. Called when traffic
+    /// transitions from idle to a large burst, so BBR discovers the
+    /// link's capacity without waiting for the 2-3s probe timer.
+    /// Only safe to call when in cruise phase (no active loss recovery).
+    pub fn triggerBandwidthProbe(self: *Bbr) void {
+        self.startProbeBW_REFILL();
+    }
+
     fn startProbeBW_REFILL(self: *Bbr) void {
         self.resetShortTermModel();
         self.bw_probe_up_rounds = 0;

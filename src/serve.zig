@@ -11,7 +11,7 @@ const log = std.log.scoped(.serve);
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_unix_write_buf = 1024 * 1024;
-const max_output_coalesce = 2 * 1024 * 1024;
+const max_pending_output = 2 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
@@ -110,6 +110,10 @@ pub const Gateway = struct {
     last_resize: ipc.Resize,
 
     client_max_offset: u32 = std.math.maxInt(u32),
+
+    /// Track whether pending_output was idle on the previous poll iteration,
+    /// for detecting idle→burst transitions that should trigger a BBR probe.
+    was_idle: bool = true,
 
     debug_log: ?std.fs.File = null,
     last_stats_ns: i64 = 0,
@@ -244,6 +248,17 @@ pub const Gateway = struct {
                 self.onPtoTimeout(now);
             }
 
+            // Detect idle→burst transition: if we were idle and now have a
+            // meaningful amount of data, trigger an early BBR bandwidth probe
+            // so it discovers the link's capacity without waiting 2-3 seconds.
+            // Only when in cruise phase (no active loss recovery).
+            if (self.was_idle and self.pending_output.items.len > self.bbr.cwnd and
+                self.bbr.state == .probe_bw and self.bbr.probe_bw_phase == .cruise)
+            {
+                self.bbr.triggerBandwidthProbe();
+            }
+            self.was_idle = self.pending_output.items.len == 0 and self.retransmit_queue.items.len == 0;
+
             try self.flushRetransmits(now);
             try self.sendPacedOutput(now);
 
@@ -277,7 +292,7 @@ pub const Gateway = struct {
                     pacer_can,
                     bbr_can,
                     self.client_max_offset,
-                    @max(@as(usize, self.bbr.cwnd) * 4, max_output_coalesce),
+                    @max(@as(usize, self.bbr.cwnd) * 4, max_pending_output),
                 });
                 self.last_stats_ns = now;
             }
@@ -286,11 +301,13 @@ pub const Gateway = struct {
             var poll_fds: [2]posix.pollfd = undefined;
             poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
 
-            // Backpressure: don't read from daemon when pending_output is full.
-            // This lets the unix socket buffer and daemon's write_buf absorb the
-            // overflow, propagating backpressure to the PTY and application.
+            // Backpressure: don't read from daemon when pending_output exceeds
+            // what the network can deliver soon. Scales with cwnd (adapts to
+            // link speed) with a 2MB floor to avoid over-constraining during
+            // startup or low-cwnd phases.
+            const bp_threshold = @max(@as(usize, self.bbr.cwnd) * 4, max_pending_output);
             var unix_events: i16 = 0;
-            if (self.pending_output.items.len < max_output_coalesce) {
+            if (self.pending_output.items.len < bp_threshold) {
                 unix_events |= posix.POLL.IN;
             }
             if (self.unix_write_buf.items.len > 0) {
