@@ -13,7 +13,9 @@ const max_stdout_buf = 16 * 1024 * 1024;
 // - ACK every ack_packet_threshold output packets
 // - ACK within ack_delay_ns if threshold not reached
 // - ACK immediately on out-of-order reception
-// ack_delay_ns must stay in sync with max_ack_delay_ns in loss.zig.
+// Note: ack_delay_ns can be shorter than max_ack_delay_ns in loss.zig.
+// The server's max_ack_delay is a worst-case assumption for PTO; the
+// client sending faster is always safe.
 const ack_delay_ns = 1 * std.time.ns_per_ms;
 const ack_packet_threshold: u32 = 4;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;

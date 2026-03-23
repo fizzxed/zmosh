@@ -222,7 +222,7 @@ const granularity_ns: i64 = std.time.ns_per_ms;
 /// Peer's max ACK delay (client-side: remote.zig/lib.zig ack_delay_ns).
 /// Used in PTO calculation (RFC 9002 §6.2.1), NOT in loss detection.
 /// The server's own ack_delay (serve.zig) may differ.
-pub const max_ack_delay_ns: i64 = 1 * std.time.ns_per_ms;
+pub const max_ack_delay_ns: i64 = 5 * std.time.ns_per_ms;
 
 pub const LossDetector = struct {
     const packet_threshold: u32 = 3;

@@ -8,7 +8,7 @@ const loss = @import("loss.zig");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_input_len = 1024 * 1024;
-// Must stay in sync with max_ack_delay_ns in loss.zig
+// Can be shorter than max_ack_delay_ns in loss.zig (server's PTO assumption)
 const ack_delay_ns = 1 * std.time.ns_per_ms;
 const ack_packet_threshold: u32 = 4;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
