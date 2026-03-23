@@ -259,6 +259,10 @@ pub const Gateway = struct {
             }
             self.was_idle = self.pending_output.items.len == 0 and self.retransmit_queue.items.len == 0;
 
+            // Defer ProbeRTT when a burst is in progress to avoid crushing
+            // cwnd to min_cwnd (4800) and stalling output for ~500ms.
+            self.bbr.suppress_probe_rtt = self.pending_output.items.len > self.bbr.cwnd;
+
             try self.flushRetransmits(now);
             try self.sendPacedOutput(now);
 

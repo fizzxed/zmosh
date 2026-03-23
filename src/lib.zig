@@ -9,7 +9,8 @@ const loss = @import("loss.zig");
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_input_len = 1024 * 1024;
 // Must stay in sync with max_ack_delay_ns in loss.zig
-const ack_delay_ns = 5 * std.time.ns_per_ms;
+const ack_delay_ns = 1 * std.time.ns_per_ms;
+const ack_packet_threshold: u32 = 4;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
 // Silence all logging in library mode.
@@ -67,6 +68,8 @@ const Session = struct {
 
     last_ack_send_ns: i64,
     ack_dirty: bool,
+    ack_pending_pkts: u32 = 0,
+    ack_immediate: bool = false,
     last_resync_request_ns: i64,
 
     output_cb: OutputFn,
@@ -307,11 +310,18 @@ export fn zmosh_poll(session: ?*Session) Status {
         s.peer.send(&s.udp_sock, pkt) catch {};
     }
 
-    // Heartbeat + delayed ACKs.
-    if (s.ack_dirty and (now - s.last_ack_send_ns) >= ack_delay_ns) {
+    // QUIC-style ACK policy.
+    const should_ack = s.ack_dirty and (s.ack_immediate or
+        s.ack_pending_pkts >= ack_packet_threshold or
+        (now - s.last_ack_send_ns) >= ack_delay_ns);
+    if (should_ack) {
         sendHeartbeat(s, now) catch {};
+        s.ack_pending_pkts = 0;
+        s.ack_immediate = false;
     } else if (s.peer.shouldSendHeartbeat(now, s.config)) {
         sendHeartbeat(s, now) catch {};
+        s.ack_pending_pkts = 0;
+        s.ack_immediate = false;
     }
 
     // State check
@@ -374,10 +384,14 @@ export fn zmosh_poll(session: ?*Session) Status {
                     .delivered => {
                         s.output_ack_tracker.onRecv(packet.seq);
                         s.ack_dirty = true;
+                        s.ack_pending_pkts += 1;
                         const deliveries = s.output_recv.deliverSlice();
                         // Track ACKs for buffered packets delivered in batch
                         for (1..deliveries.len()) |di| {
                             s.output_ack_tracker.onRecv(s.output_recv.deliver_start +% @as(u32, @intCast(di)) *% transport.step);
+                        }
+                        if (deliveries.len() > 1) {
+                            s.ack_pending_pkts += @intCast(deliveries.len() - 1);
                         }
                         for (0..deliveries.len()) |i| {
                             const p = deliveries.get(i);
@@ -389,6 +403,8 @@ export fn zmosh_poll(session: ?*Session) Status {
                     .buffered => {
                         s.output_ack_tracker.onRecv(packet.seq);
                         s.ack_dirty = true;
+                        s.ack_pending_pkts += 1;
+                        s.ack_immediate = true; // out-of-order
                     },
                     .gap_resync => {
                         s.output_ack_tracker = .{};

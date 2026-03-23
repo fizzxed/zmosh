@@ -278,6 +278,11 @@ pub const Bbr = struct {
     undo_inflight_shortterm: u32 = max_u32,
     undo_inflight_longterm: u32 = max_u32,
 
+    // --- Caller-managed context ---
+    /// Set by the gateway when a burst is in progress (pending_output > cwnd).
+    /// Defers ProbeRTT entry to avoid crushing cwnd mid-burst.
+    suppress_probe_rtt: bool = false,
+
     // --- PRNG state ---
     rng_state: u64 = 0,
 
@@ -1006,9 +1011,11 @@ pub const Bbr = struct {
     }
 
     fn checkProbeRTT(self: *Bbr, rs: RateSample, now: i64) void {
-        // Don't enter ProbeRTT during Startup — bandwidth hasn't stabilized yet
+        // Don't enter ProbeRTT during Startup (bandwidth hasn't stabilized)
+        // or when a burst is in progress (would stall output for ~500ms).
         if (self.state != .probe_rtt and self.probe_rtt_expired and
-            !self.idle_restart and self.state != .startup)
+            !self.idle_restart and self.state != .startup and
+            !self.suppress_probe_rtt)
         {
             self.enterProbeRTT();
             self.saveCwnd();

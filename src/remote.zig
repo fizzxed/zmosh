@@ -9,10 +9,13 @@ const builtin = @import("builtin");
 
 const max_ipc_payload = transport.max_payload_len - @sizeOf(ipc.Header);
 const max_stdout_buf = 16 * 1024 * 1024;
-// Client ACK delay: how long to wait before sending output ACKs.
-// Must stay in sync with max_ack_delay_ns in loss.zig (the server's loss
-// detector accounts for this delay to avoid spurious retransmits).
-const ack_delay_ns = 5 * std.time.ns_per_ms;
+// Client ACK policy (QUIC-style):
+// - ACK every ack_packet_threshold output packets
+// - ACK within ack_delay_ns if threshold not reached
+// - ACK immediately on out-of-order reception
+// ack_delay_ns must stay in sync with max_ack_delay_ns in loss.zig.
+const ack_delay_ns = 1 * std.time.ns_per_ms;
+const ack_packet_threshold: u32 = 4;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
 const c = switch (builtin.os.tag) {
@@ -366,6 +369,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
+    var ack_pending_pkts: u32 = 0; // output packets since last ACK
+    var ack_immediate = false; // out-of-order detected, ACK ASAP
     var last_resync_request_ns: i64 = 0;
     // Send Init message with terminal size (reliable)
     const term_size = getTerminalSize();
@@ -389,11 +394,22 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             peer.send(&udp_sock, pkt) catch {};
         }
 
-        // Ack heartbeat + keepalive heartbeat.
-        if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
+        // QUIC-style ACK policy: send ACK when any of:
+        // - Packet threshold reached (every 2 output packets)
+        // - Out-of-order detected (immediate)
+        // - Delay timeout (1ms since first unacked packet)
+        // - Keepalive interval
+        const should_ack = ack_dirty and (ack_immediate or
+            ack_pending_pkts >= ack_packet_threshold or
+            (now - last_ack_send_ns) >= ack_delay_ns);
+        if (should_ack) {
             sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &output_recv, stdout_buf.items.len, recv_cap, &last_ack_send_ns, &ack_dirty, now) catch {};
+            ack_pending_pkts = 0;
+            ack_immediate = false;
         } else if (peer.shouldSendHeartbeat(now, config)) {
             sendHeartbeat(&peer, &udp_sock, &reliable_recv, &output_ack_tracker, &output_recv, stdout_buf.items.len, recv_cap, &last_ack_send_ns, &ack_dirty, now) catch {};
+            ack_pending_pkts = 0;
+            ack_immediate = false;
         }
 
         // State check
@@ -439,7 +455,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             const rto_ms = @divFloor(peer.rto_us(), 1000);
             poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
         }
-        if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 5));
+        if (ack_immediate) {
+            poll_timeout = 0; // out-of-order: ACK immediately
+        } else if (ack_dirty) {
+            poll_timeout = @min(poll_timeout, @as(i64, 1)); // 1ms ACK delay
+        }
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
             if (err == error.Interrupted) continue;
@@ -518,11 +538,13 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                             .delivered => {
                                 output_ack_tracker.onRecv(packet.seq);
                                 ack_dirty = true;
+                                ack_pending_pkts += 1;
                                 const deliveries = output_recv.deliverSlice();
                                 if (deliveries.len() > 1) {
                                     for (1..deliveries.len()) |di| {
                                         output_ack_tracker.onRecv(output_recv.deliver_start +% @as(u32, @intCast(di)) *% transport.step);
                                     }
+                                    ack_pending_pkts += @intCast(deliveries.len() - 1);
                                 }
                                 for (0..deliveries.len()) |i| {
                                     const p = deliveries.get(i);
@@ -538,6 +560,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                             .buffered => {
                                 output_ack_tracker.onRecv(packet.seq);
                                 ack_dirty = true;
+                                ack_pending_pkts += 1;
+                                ack_immediate = true; // out-of-order
                             },
                             .gap_resync => {
                                 output_ack_tracker = .{};
