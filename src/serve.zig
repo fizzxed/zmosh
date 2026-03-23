@@ -15,13 +15,6 @@ const max_output_coalesce = 2 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
-fn debugWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
-    const file = f orelse return;
-    var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    file.writeAll(msg) catch return;
-}
-
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn handleSigterm(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
@@ -111,9 +104,6 @@ pub const Gateway = struct {
 
     client_max_offset: u32 = std.math.maxInt(u32),
 
-    debug_log: ?std.fs.File = null,
-    last_stats_ns: i64 = 0,
-    output_pkts_sent: u64 = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -209,14 +199,6 @@ pub const Gateway = struct {
             .last_resize = .{ .rows = 24, .cols = 80 },
         };
         gw.retransmit_queue = std.ArrayListUnmanaged(u32).initBuffer(&gw.retransmit_buf);
-        gw.debug_log = blk: {
-            const home = posix.getenv("HOME") orelse "/tmp";
-            var path_buf: [256]u8 = undefined;
-            const path = std.fmt.bufPrint(&path_buf, "{s}/zmosh-server-debug.log", .{home}) catch break :blk std.fs.createFileAbsolute("/tmp/zmosh-server-debug.log", .{ .truncate = true }) catch null;
-            break :blk std.fs.createFileAbsolute(path, .{ .truncate = true }) catch null;
-        };
-        debugWrite(gw.debug_log, "zmosh server debug started\n", .{});
-
         return gw;
     }
 
@@ -262,32 +244,17 @@ pub const Gateway = struct {
                 }
             }
 
-            if (now - self.last_stats_ns >= 2 * std.time.ns_per_s) {
-                const srtt_ms: i64 = if (self.output_srtt_ns > 0) @divFloor(self.output_srtt_ns, std.time.ns_per_ms) else -1;
-                debugWrite(self.debug_log, "S off={d} pend={d} infl={d} cwnd={d} bw={d} s={d}.{d} lost={d} srtt={d} maxinfl={d} il={d} is={d} flow={d} pkts={d}\n", .{
-                    self.output_offset,
-                    self.pending_output.items.len,
-                    self.bbr.inflight,
-                    self.bbr.cwnd,
-                    self.bbr.bw,
-                    @intFromEnum(self.bbr.state),
-                    @intFromEnum(self.bbr.probe_bw_phase),
-                    self.bbr.total_lost,
-                    srtt_ms,
-                    self.bbr.max_inflight,
-                    self.bbr.inflight_longterm,
-                    self.bbr.inflight_shortterm,
-                    self.client_max_offset,
-                    self.output_pkts_sent,
-                });
-                self.last_stats_ns = now;
-            }
-
             // Build poll fds
             var poll_fds: [2]posix.pollfd = undefined;
             poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
 
-            var unix_events: i16 = posix.POLL.IN;
+            // Backpressure: don't read from daemon when pending_output is full.
+            // This lets the unix socket buffer and daemon's write_buf absorb the
+            // overflow, propagating backpressure to the PTY and application.
+            var unix_events: i16 = 0;
+            if (self.pending_output.items.len < max_output_coalesce) {
+                unix_events |= posix.POLL.IN;
+            }
             if (self.unix_write_buf.items.len > 0) {
                 unix_events |= posix.POLL.OUT;
             }
@@ -326,11 +293,6 @@ pub const Gateway = struct {
                     }
 
                     while (self.unix_read_buf.next()) |msg| {
-                        if (msg.header.tag != .Output) {
-                            debugWrite(self.debug_log, "IPC tag={d} len={d}\n", .{
-                                @intFromEnum(msg.header.tag), msg.payload.len,
-                            });
-                        }
                         try self.forwardDaemonMessage(msg.header.tag, msg.payload, now);
                     }
                 }
@@ -450,11 +412,6 @@ pub const Gateway = struct {
 
             entry.retransmit_count +|= 1;
             entry.sent_time = now;
-            const buf_distance = (self.send_buf.tail_offset -% self.send_buf.head_offset) / transport.step;
-            debugWrite(self.debug_log, "RTX offset={d} len={d} rtx_count={d} buf_dist={d}/{d}\n", .{
-                rtx_offset, rtx_payload.len, entry.retransmit_count,
-                buf_distance, loss.SendBuffer.capacity,
-            });
             // Do NOT increment inflight for retransmits. onLoss already
             // decremented it. Re-incrementing causes drift: if markAcked
             // returns null (already acked from original), onAckPacket
@@ -477,17 +434,6 @@ pub const Gateway = struct {
             const end = @min(transport.max_payload_len, self.pending_output.items.len);
             const chunk = self.pending_output.items[0..end];
             const offset = self.output_offset;
-
-            // Check for send buffer wraparound — would this overwrite an unacked entry?
-            {
-                const slot = (offset / transport.step) % loss.SendBuffer.capacity;
-                const existing = &self.send_buf.entries[slot];
-                if (existing.in_use and !existing.acked and existing.offset != offset) {
-                    debugWrite(self.debug_log, "BUF_OVERWRITE slot={d} new_off={d} old_off={d} old_acked={}\n", .{
-                        slot, offset, existing.offset, existing.acked,
-                    });
-                }
-            }
 
             // OnPacketSent: init + snapshot + update inflight (spec §4.1.2.2)
             const ds = self.bbr.onSend(@intCast(chunk.len), now);
@@ -512,10 +458,6 @@ pub const Gateway = struct {
                 return err;
             };
 
-            self.output_pkts_sent += 1;
-            debugWrite(self.debug_log, "SEND offset={d} len={d} infl={d} cwnd={d} flow={d}\n", .{
-                offset, chunk.len, self.bbr.inflight, self.bbr.cwnd, self.client_max_offset,
-            });
             self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
             self.output_offset +%= transport.step;
             // Remove sent data from pending buffer
@@ -845,12 +787,6 @@ pub const Gateway = struct {
 
     fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
         if (tag == .Output) {
-            if (self.pending_output.items.len + payload.len > max_output_coalesce) {
-                debugWrite(self.debug_log, "PENDING_OVERFLOW buf={d} payload={d}; requesting snapshot\n", .{ self.pending_output.items.len, payload.len });
-                self.pending_output.clearRetainingCapacity();
-                try self.requestSnapshot(now);
-                return;
-            }
             try self.pending_output.appendSlice(self.alloc, payload);
             return;
         }
@@ -911,7 +847,6 @@ pub const Gateway = struct {
     }
 
     pub fn deinit(self: *Gateway) void {
-        if (self.debug_log) |f| f.close();
         posix.close(self.unix_fd);
         self.udp_sock.close();
         self.unix_read_buf.deinit();

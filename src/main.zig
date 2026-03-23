@@ -1448,9 +1448,21 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             .revents = 0,
         });
 
+        // Backpressure: don't read from PTY when any client's write buffer
+        // is too large. This propagates backpressure to the application via
+        // the PTY kernel buffer, same as SSH's TCP backpressure.
+        const max_client_write_buf = 2 * 1024 * 1024;
+        var pty_backpressure = false;
+        for (daemon.clients.items) |client| {
+            if (client.write_buf.items.len > max_client_write_buf) {
+                pty_backpressure = true;
+                break;
+            }
+        }
+
         try poll_fds.append(daemon.alloc, .{
             .fd = pty_fd,
-            .events = posix.POLL.IN,
+            .events = if (pty_backpressure) @as(i16, 0) else posix.POLL.IN,
             .revents = 0,
         });
 
