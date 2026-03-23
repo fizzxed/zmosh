@@ -275,6 +275,13 @@ fn requestResync(
     last_resync_request_ns.* = now;
 }
 
+fn debugWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
+    const file = f orelse return;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    file.writeAll(msg) catch return;
+}
+
 /// Remote attach: connect to a remote zmx session via UDP.
 pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     // Resolve host address — try numeric IP first, fall back to DNS
@@ -309,6 +316,11 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var reliable_recv = transport.RecvState{};
     var output_recv = transport.OutputRecvState{};
     var output_ack_tracker = loss.OutputAckTracker{};
+
+    const debug_log: ?std.fs.File = std.fs.createFileAbsolute("/tmp/zmosh-debug.log", .{ .truncate = true }) catch null;
+    defer if (debug_log) |f| f.close();
+
+    var last_stats_dump_ns: i64 = 0;
 
     // Set terminal to raw mode
     var orig_termios: c.termios = undefined;
@@ -392,6 +404,20 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         } else if (state == .connected and was_disconnected) {
             _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
             was_disconnected = false;
+        }
+
+        if (now - last_stats_dump_ns >= 2 * std.time.ns_per_s) {
+            const srtt_ms = if (peer.srtt_us) |s| @divFloor(s, 1000) else @as(i64, -1);
+            debugWrite(debug_log, "C delivered={d} buffered={d} gap_resync={d} max_reorder={d} stdout_buf={d} next_off={d} srtt={d}\n", .{
+                output_recv.delivered_total,
+                output_recv.buffered_total,
+                output_recv.gap_resync_total,
+                output_recv.max_reorder_dist,
+                stdout_buf.items.len,
+                output_recv.next_offset,
+                srtt_ms,
+            });
+            last_stats_dump_ns = now;
         }
 
         // Build poll fds
@@ -481,6 +507,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                     },
                     .output => {
                         const action = output_recv.onPacket(packet.seq, packet.payload);
+                        debugWrite(debug_log, "OUT off={d} len={d} act={d} next={d} sbuf={d}\n", .{
+                            packet.seq, packet.payload.len, @intFromEnum(action), output_recv.next_offset, stdout_buf.items.len,
+                        });
                         switch (action) {
                             .delivered => {
                                 output_ack_tracker.onRecv(packet.seq);
@@ -522,11 +551,15 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         // Flush stdout
         if (poll_count == 3 and poll_fds[2].revents & posix.POLL.OUT != 0) {
             if (stdout_buf.items.len > 0) {
+                const total = stdout_buf.items.len;
                 const written = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     return err;
                 };
                 if (written > 0) {
+                    if (written != total) {
+                        debugWrite(debug_log, "WRITE {d}/{d}\n", .{ written, total });
+                    }
                     try stdout_buf.replaceRange(alloc, 0, written, &[_]u8{});
                 }
             }
