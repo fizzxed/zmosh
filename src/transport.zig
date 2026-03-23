@@ -2,7 +2,7 @@ const std = @import("std");
 const ipc = @import("ipc.zig");
 
 pub const version: u8 = 2;
-pub const max_payload_len: usize = 1356;
+pub const max_payload_len: usize = 1100;
 const header_len: usize = 20;
 
 pub const Channel = enum(u8) {

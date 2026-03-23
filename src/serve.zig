@@ -248,14 +248,11 @@ pub const Gateway = struct {
             var poll_fds: [2]posix.pollfd = undefined;
             poll_fds[0] = .{ .fd = self.udp_sock.getFd(), .events = posix.POLL.IN, .revents = 0 };
 
-            // Backpressure: don't read from daemon when pending_output is too
-            // far ahead of what the network can deliver. The threshold scales
-            // with cwnd (so it adapts to link speed) but has a floor to avoid
-            // over-constraining during startup or low-cwnd phases. This keeps
-            // the application running at roughly network speed.
-            const bp_threshold = @max(@as(usize, self.bbr.cwnd) * 4, max_output_coalesce);
+            // Backpressure: don't read from daemon when pending_output is full.
+            // This lets the unix socket buffer and daemon's write_buf absorb the
+            // overflow, propagating backpressure to the PTY and application.
             var unix_events: i16 = 0;
-            if (self.pending_output.items.len < bp_threshold) {
+            if (self.pending_output.items.len < max_output_coalesce) {
                 unix_events |= posix.POLL.IN;
             }
             if (self.unix_write_buf.items.len > 0) {
@@ -360,7 +357,7 @@ pub const Gateway = struct {
     }
 
     fn sendHeartbeat(self: *Gateway, now: i64) !void {
-        var pkt_buf: [1400]u8 = undefined;
+        var pkt_buf: [1200]u8 = undefined;
         const pkt = try transport.buildUnreliable(
             .heartbeat,
             0,
@@ -394,7 +391,7 @@ pub const Gateway = struct {
             const entry = self.send_buf.getForRetransmit(rtx_offset) orelse continue;
             const rtx_payload = self.send_buf.getPayload(rtx_offset) orelse continue;
 
-            var pkt_buf: [1400]u8 = undefined;
+            var pkt_buf: [1200]u8 = undefined;
             const pkt = try transport.buildUnreliable(
                 .output,
                 rtx_offset,
@@ -442,7 +439,7 @@ pub const Gateway = struct {
             const ds = self.bbr.onSend(@intCast(chunk.len), now);
             self.send_buf.recordSend(offset, chunk, now, ds);
 
-            var pkt_buf: [1400]u8 = undefined;
+            var pkt_buf: [1200]u8 = undefined;
             const pkt = try transport.buildUnreliable(
                 .output,
                 offset,
@@ -1048,7 +1045,7 @@ test "integration: BBR paced output delivery with simulated loss" {
             const ranges = output_ack_tracker.generateAckRanges(&gap_buf);
             var ack_payload_buf: [128]u8 = undefined;
             const ack_payload = ranges.encode(&ack_payload_buf) catch "";
-            var pkt_buf: [1400]u8 = undefined;
+            var pkt_buf: [1200]u8 = undefined;
             const pkt = transport.buildUnreliable(.heartbeat, 0, 0, 0, ack_payload, &pkt_buf) catch continue;
             client_peer.send(&client_udp, pkt) catch {};
         }
@@ -1182,7 +1179,7 @@ test "integration: sequential image-like bursts with loss" {
             const ranges = output_ack_tracker.generateAckRanges(&gap_buf);
             var ack_payload_buf: [128]u8 = undefined;
             const ack_payload = ranges.encode(&ack_payload_buf) catch "";
-            var pkt_buf: [1400]u8 = undefined;
+            var pkt_buf: [1200]u8 = undefined;
             const pkt = transport.buildUnreliable(.heartbeat, 0, 0, 0, ack_payload, &pkt_buf) catch continue;
             client_peer.send(&client_udp, pkt) catch {};
         }

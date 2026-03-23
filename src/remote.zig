@@ -197,7 +197,7 @@ fn sendHeartbeat(
     std.mem.writeInt(u32, hb_payload_buf[ack_payload.len..][0..4], max_offset, .big);
     const hb_payload = hb_payload_buf[0 .. ack_payload.len + 4];
 
-    var pkt_buf: [1400]u8 = undefined;
+    var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
         .heartbeat,
         0,
