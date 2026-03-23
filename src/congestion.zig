@@ -9,7 +9,7 @@ const max_payload_len: u32 = transport.max_payload_len;
 // Constants (BBR v3, draft-ietf-ccwg-bbr-05)
 // ---------------------------------------------------------------------------
 
-pub const max_datagram_size: u32 = 1200; // C.SMSS
+pub const max_datagram_size: u32 = 1400; // C.SMSS
 pub const initial_cwnd: u32 = 10 * max_datagram_size; // 12,000
 /// Minimum cwnd floor: 4*SMSS per BBR spec.
 pub const min_cwnd: u32 = 4 * max_datagram_size;
