@@ -209,7 +209,12 @@ pub const Gateway = struct {
             .last_resize = .{ .rows = 24, .cols = 80 },
         };
         gw.retransmit_queue = std.ArrayListUnmanaged(u32).initBuffer(&gw.retransmit_buf);
-        gw.debug_log = std.fs.createFileAbsolute("/tmp/zmosh-server-debug.log", .{ .truncate = true }) catch null;
+        gw.debug_log = blk: {
+            const home = posix.getenv("HOME") orelse "/tmp";
+            var path_buf: [256]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/zmosh-server-debug.log", .{home}) catch break :blk std.fs.createFileAbsolute("/tmp/zmosh-server-debug.log", .{ .truncate = true }) catch null;
+            break :blk std.fs.createFileAbsolute(path, .{ .truncate = true }) catch null;
+        };
         debugWrite(gw.debug_log, "zmosh server debug started\n", .{});
 
         return gw;
@@ -321,6 +326,11 @@ pub const Gateway = struct {
                     }
 
                     while (self.unix_read_buf.next()) |msg| {
+                        if (msg.header.tag != .Output) {
+                            debugWrite(self.debug_log, "IPC tag={d} len={d}\n", .{
+                                @intFromEnum(msg.header.tag), msg.payload.len,
+                            });
+                        }
                         try self.forwardDaemonMessage(msg.header.tag, msg.payload, now);
                     }
                 }
@@ -440,6 +450,11 @@ pub const Gateway = struct {
 
             entry.retransmit_count +|= 1;
             entry.sent_time = now;
+            const buf_distance = (self.send_buf.tail_offset -% self.send_buf.head_offset) / transport.step;
+            debugWrite(self.debug_log, "RTX offset={d} len={d} rtx_count={d} buf_dist={d}/{d}\n", .{
+                rtx_offset, rtx_payload.len, entry.retransmit_count,
+                buf_distance, loss.SendBuffer.capacity,
+            });
             // Do NOT increment inflight for retransmits. onLoss already
             // decremented it. Re-incrementing causes drift: if markAcked
             // returns null (already acked from original), onAckPacket
@@ -462,6 +477,17 @@ pub const Gateway = struct {
             const end = @min(transport.max_payload_len, self.pending_output.items.len);
             const chunk = self.pending_output.items[0..end];
             const offset = self.output_offset;
+
+            // Check for send buffer wraparound — would this overwrite an unacked entry?
+            {
+                const slot = (offset / transport.step) % loss.SendBuffer.capacity;
+                const existing = &self.send_buf.entries[slot];
+                if (existing.in_use and !existing.acked and existing.offset != offset) {
+                    debugWrite(self.debug_log, "BUF_OVERWRITE slot={d} new_off={d} old_off={d} old_acked={}\n", .{
+                        slot, offset, existing.offset, existing.acked,
+                    });
+                }
+            }
 
             // OnPacketSent: init + snapshot + update inflight (spec §4.1.2.2)
             const ds = self.bbr.onSend(@intCast(chunk.len), now);
@@ -487,6 +513,9 @@ pub const Gateway = struct {
             };
 
             self.output_pkts_sent += 1;
+            debugWrite(self.debug_log, "SEND offset={d} len={d} infl={d} cwnd={d} flow={d}\n", .{
+                offset, chunk.len, self.bbr.inflight, self.bbr.cwnd, self.client_max_offset,
+            });
             self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
             self.output_offset +%= transport.step;
             // Remove sent data from pending buffer
@@ -817,7 +846,7 @@ pub const Gateway = struct {
     fn forwardDaemonMessage(self: *Gateway, tag: ipc.Tag, payload: []const u8, now: i64) !void {
         if (tag == .Output) {
             if (self.pending_output.items.len + payload.len > max_output_coalesce) {
-                log.debug("output pending overflow buf={d} payload={d}; requesting snapshot", .{ self.pending_output.items.len, payload.len });
+                debugWrite(self.debug_log, "PENDING_OVERFLOW buf={d} payload={d}; requesting snapshot\n", .{ self.pending_output.items.len, payload.len });
                 self.pending_output.clearRetainingCapacity();
                 try self.requestSnapshot(now);
                 return;

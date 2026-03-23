@@ -575,11 +575,20 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         // Flush stdout
         if (poll_count == 3 and poll_fds[2].revents & posix.POLL.OUT != 0) {
             if (stdout_buf.items.len > 0) {
+                const total = stdout_buf.items.len;
                 const written = posix.write(posix.STDOUT_FILENO, stdout_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     return err;
                 };
                 if (written > 0) {
+                    // Log partial writes and boundary bytes for escape split detection
+                    const last_byte = stdout_buf.items[written - 1];
+                    const next_byte: u8 = if (written < total) stdout_buf.items[written] else 0;
+                    if (written != total or last_byte == 0x1b) {
+                        debugWrite(debug_log, "WRITE {d}/{d} last=0x{x:0>2} next=0x{x:0>2}\n", .{
+                            written, total, last_byte, next_byte,
+                        });
+                    }
                     try stdout_buf.replaceRange(alloc, 0, written, &[_]u8{});
                 }
             }
