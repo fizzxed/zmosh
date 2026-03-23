@@ -275,6 +275,13 @@ fn requestResync(
     last_resync_request_ns.* = now;
 }
 
+fn debugWrite(f: ?std.fs.File, comptime fmt: []const u8, args: anytype) void {
+    const file = f orelse return;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    file.writeAll(msg) catch return;
+}
+
 /// Remote attach: connect to a remote zmx session via UDP.
 pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     // Resolve host address — try numeric IP first, fall back to DNS
@@ -309,6 +316,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var reliable_recv = transport.RecvState{};
     var output_recv = transport.OutputRecvState{};
     var output_ack_tracker = loss.OutputAckTracker{};
+
+    const debug_log: ?std.fs.File = std.fs.createFileAbsolute("/tmp/zmosh-debug.log", .{ .truncate = true }) catch null;
+    defer if (debug_log) |f| f.close();
+    debugWrite(debug_log, "zmosh debug log started\n", .{});
 
     // Set terminal to raw mode
     var orig_termios: c.termios = undefined;
@@ -351,6 +362,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var last_ack_send_ns: i64 = @intCast(std.time.nanoTimestamp());
     var ack_dirty = false;
     var last_resync_request_ns: i64 = 0;
+    var last_stats_dump_ns: i64 = 0;
+    var output_pkts_this_interval: u64 = 0;
+    var last_output_pkt_ns: i64 = 0;
     // Send Init message with terminal size (reliable)
     const term_size = getTerminalSize();
     var init_buf: [64]u8 = undefined;
@@ -392,6 +406,26 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         } else if (state == .connected and was_disconnected) {
             _ = posix.write(posix.STDOUT_FILENO, "\x1b7\x1b[999;1H\x1b[2K\x1b8") catch {};
             was_disconnected = false;
+        }
+
+        // Periodic debug stats dump
+        if (now - last_stats_dump_ns >= 2 * std.time.ns_per_s) {
+            const srtt_ms = if (peer.srtt_us) |s| @divFloor(s, 1000) else @as(i64, -1);
+            const since_last_pkt_ms = if (last_output_pkt_ns > 0) @divFloor(now - last_output_pkt_ns, std.time.ns_per_ms) else @as(i64, -1);
+            debugWrite(debug_log, "stats: delivered={d} buffered={d} gap_resync={d} max_reorder={d} stdout_buf={d} next_offset={d} srtt_ms={d} pkts_2s={d} since_last_ms={d} ack_dirty={}\n", .{
+                output_recv.delivered_total,
+                output_recv.buffered_total,
+                output_recv.gap_resync_total,
+                output_recv.max_reorder_dist,
+                stdout_buf.items.len,
+                output_recv.next_offset,
+                srtt_ms,
+                output_pkts_this_interval,
+                since_last_pkt_ms,
+                ack_dirty,
+            });
+            last_stats_dump_ns = now;
+            output_pkts_this_interval = 0;
         }
 
         // Build poll fds
@@ -480,7 +514,21 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                         }
                     },
                     .output => {
+                        output_pkts_this_interval += 1;
+                        last_output_pkt_ns = now;
                         const action = output_recv.onPacket(packet.seq, packet.payload);
+                        debugWrite(debug_log, "OUT offset={d} len={d} action={s} next_offset={d}\n", .{
+                            packet.seq,
+                            packet.payload.len,
+                            switch (action) {
+                                .delivered => "delivered",
+                                .buffered => "buffered",
+                                .duplicate => "duplicate",
+                                .stale => "stale",
+                                .gap_resync => "gap_resync",
+                            },
+                            output_recv.next_offset,
+                        });
                         switch (action) {
                             .delivered => {
                                 output_ack_tracker.onRecv(packet.seq);
@@ -496,6 +544,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                     const p = deliveries.get(i);
                                     if (p.len == 0) continue;
                                     if (stdout_buf.items.len + p.len > max_stdout_buf) {
+                                        debugWrite(debug_log, "STDOUT_OVERFLOW buf={d} payload={d}\n", .{ stdout_buf.items.len, p.len });
                                         stdout_buf.clearRetainingCapacity();
                                         try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
                                         break;
@@ -503,12 +552,14 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                                     try stdout_buf.appendSlice(alloc, p);
                                     deliver_bytes += p.len;
                                 }
+                                debugWrite(debug_log, "DELIVER count={d} bytes={d} stdout_buf={d}\n", .{ deliveries.len(), deliver_bytes, stdout_buf.items.len });
                             },
                             .buffered => {
                                 output_ack_tracker.onRecv(packet.seq);
                                 ack_dirty = true;
                             },
                             .gap_resync => {
+                                debugWrite(debug_log, "GAP_RESYNC offset={d} new_next_offset={d} (window={d})\n", .{ packet.seq, output_recv.next_offset, transport.OutputRecvState.window_size });
                                 output_ack_tracker = .{};
                                 ack_dirty = true;
                                 stdout_buf.clearRetainingCapacity();
