@@ -418,6 +418,9 @@ pub const Gateway = struct {
             return;
         }
 
+        // Update pacer quantum from current cwnd (picoquic-style: cwnd/4).
+        self.pacer.setQuantum(self.bbr.cwnd);
+
         // Grant initial burst when transitioning from idle to active
         if (self.bbr.inflight == 0 and
             (self.pending_output.items.len > 0 or self.retransmit_queue.items.len > 0))

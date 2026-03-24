@@ -1302,11 +1302,10 @@ pub const Bbr = struct {
 pub const Pacer = struct {
     /// Initial burst allowance after idle, in packets.
     const initial_burst_packets: u32 = 10;
-    /// Packets per burst quantum. 10 packets balances router queue
-    /// safety with accurate BBR bandwidth measurement.
-    const quantum_packets: u32 = 10;
-    /// Burst budget in bytes for one quantum.
-    const quantum_bytes: u32 = quantum_packets * max_datagram_size;
+    /// Minimum quantum: 2 packets (picoquic's 2*send_mtu floor).
+    const min_quantum: u32 = 2 * max_datagram_size;
+    /// Maximum quantum: 16 packets (picoquic's 16*send_mtu cap).
+    const max_quantum: u32 = 16 * max_datagram_size;
 
     /// Accumulated send credit in nanoseconds.
     bucket_ns: i64 = 0,
@@ -1319,9 +1318,16 @@ pub const Pacer = struct {
     /// Remaining bytes in current burst. Packets within a burst send
     /// back-to-back without per-packet credit checks.
     burst_remaining: u32 = 0,
+    /// Current quantum in bytes. Derived from cwnd/4 (picoquic-style).
+    quantum_bytes: u32 = initial_burst_packets * max_datagram_size,
 
     /// Check if sending is allowed: either burst budget remains, or
     /// the bucket has enough credit for the next quantum.
+    /// Set quantum from current cwnd (picoquic-style: cwnd/4, clamped).
+    pub fn setQuantum(self: *Pacer, cwnd: u32) void {
+        self.quantum_bytes = @min(max_quantum, @max(min_quantum, cwnd / 4));
+    }
+
     pub fn canSend(self: *Pacer, now: i64) bool {
         if (self.burst_remaining > 0) return true;
         self.refill(now);
@@ -1341,7 +1347,7 @@ pub const Pacer = struct {
         // Burst exhausted — deduct quantum cost from bucket, grant new burst.
         self.refill(now);
         self.bucket_ns -= self.quantum_time_ns;
-        self.burst_remaining = quantum_bytes -| packet_size;
+        self.burst_remaining = self.quantum_bytes -| packet_size;
     }
 
     /// Grant full burst credit after idle→active transition.
@@ -1385,13 +1391,10 @@ pub const Pacer = struct {
             return;
         }
         self.quantum_time_ns = @intCast(
-            @as(u64, quantum_bytes) * ns_per_s / pacing_rate,
+            @as(u64, self.quantum_bytes) * ns_per_s / pacing_rate,
         );
-        // Bucket holds initial_burst_packets / quantum_packets + 1 quanta.
-        // With both at 10: 2 quanta. Enough to send one burst while the
-        // next refills.
-        self.bucket_max_ns = self.quantum_time_ns *
-            (initial_burst_packets / quantum_packets + 1);
+        // Bucket holds 2 quanta.
+        self.bucket_max_ns = self.quantum_time_ns * 2;
     }
 };
 
