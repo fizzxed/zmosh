@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
@@ -320,14 +321,24 @@ pub const Gateway = struct {
             poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
 
             const poll_timeout_ns = self.computePollTimeoutNs(now);
-            const ts = posix.timespec{
-                .sec = @intCast(@divFloor(poll_timeout_ns, std.time.ns_per_s)),
-                .nsec = @intCast(@mod(poll_timeout_ns, std.time.ns_per_s)),
-            };
-            _ = posix.ppoll(&poll_fds, &ts, null) catch |err| {
-                if (err == error.SignalInterrupt) continue;
-                return err;
-            };
+            // Use ppoll (nanosecond precision) on Linux for sub-ms pacing.
+            // Fall back to poll (millisecond precision) on macOS/others.
+            if (comptime builtin.os.tag == .linux) {
+                const ts = posix.timespec{
+                    .sec = @intCast(@divFloor(poll_timeout_ns, std.time.ns_per_s)),
+                    .nsec = @intCast(@mod(poll_timeout_ns, std.time.ns_per_s)),
+                };
+                _ = posix.ppoll(&poll_fds, &ts, null) catch |err| {
+                    if (err == error.SignalInterrupt) continue;
+                    return err;
+                };
+            } else {
+                const poll_ms: i32 = @intCast(@max(@as(i64, 0), @divFloor(poll_timeout_ns, std.time.ns_per_ms)));
+                _ = posix.poll(&poll_fds, poll_ms) catch |err| {
+                    if (err == error.Interrupted) continue;
+                    return err;
+                };
+            }
 
             // Handle incoming UDP datagrams → decrypt → decode transport packet
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
