@@ -111,9 +111,6 @@ pub const Gateway = struct {
 
     client_max_offset: u32 = std.math.maxInt(u32),
 
-    /// Track whether pending_output was idle on the previous poll iteration,
-    /// for detecting idle→burst transitions that should trigger a BBR probe.
-    was_idle: bool = true,
 
     debug_log: ?std.fs.File = null,
     last_stats_ns: i64 = 0,
@@ -247,17 +244,6 @@ pub const Gateway = struct {
                 // PTO fired: send probe to elicit ACK
                 self.onPtoTimeout(now);
             }
-
-            // Trigger an early BBR bandwidth probe on idle→burst transitions:
-            // if we were idle and now have meaningful data, probe for bandwidth
-            // so BBR discovers link capacity without waiting 2-3 seconds.
-            // Only when in cruise phase (no active loss recovery).
-            if (self.was_idle and self.pending_output.items.len > self.bbr.cwnd and
-                self.bbr.state == .probe_bw and self.bbr.probe_bw_phase == .cruise)
-            {
-                self.bbr.triggerBandwidthProbe();
-            }
-            self.was_idle = self.pending_output.items.len == 0 and self.retransmit_queue.items.len == 0;
 
             try self.flushRetransmits(now);
             try self.sendPacedOutput(now);
