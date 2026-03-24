@@ -1306,7 +1306,9 @@ pub const Bbr = struct {
 /// maximum burst size after idle. Set to 10 packets' worth — enough
 /// for the initial probe without causing router queue overflow.
 ///
-/// See: https://github.com/private-octopus/picoquic/blob/master/picoquic/pacing.c
+/// References:
+/// - RFC 9002 §7.7 recommends a leaky bucket algorithm for pacing
+/// - picoquic's implementation: https://github.com/private-octopus/picoquic/blob/master/picoquic/pacing.c
 pub const Pacer = struct {
     /// Accumulated send credit in nanoseconds.
     bucket_ns: i64 = 0,

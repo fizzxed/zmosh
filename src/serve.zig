@@ -248,9 +248,9 @@ pub const Gateway = struct {
                 self.onPtoTimeout(now);
             }
 
-            // Detect idle→burst transition: if we were idle and now have a
-            // meaningful amount of data, trigger an early BBR bandwidth probe
-            // so it discovers the link's capacity without waiting 2-3 seconds.
+            // Trigger an early BBR bandwidth probe on idle→burst transitions:
+            // if we were idle and now have meaningful data, probe for bandwidth
+            // so BBR discovers link capacity without waiting 2-3 seconds.
             // Only when in cruise phase (no active loss recovery).
             if (self.was_idle and self.pending_output.items.len > self.bbr.cwnd and
                 self.bbr.state == .probe_bw and self.bbr.probe_bw_phase == .cruise)
@@ -479,16 +479,6 @@ pub const Gateway = struct {
         while (self.bbr.canSend() and self.pacer.canSend(now)) {
             // New data from pending_output
             if (self.pending_output.items.len == 0) break;
-
-            // Before the client's first flow control window arrives, cap inflight
-            // to initial_cwnd. Without this, Startup's 2.77x pacing gain blasts
-            // hundreds of KB into the network before the client can advertise its
-            // capacity, causing massive packet loss at router queues.
-            if (self.client_max_offset == std.math.maxInt(u32) and
-                self.bbr.inflight >= congestion.initial_cwnd)
-            {
-                break;
-            }
 
             // Flow control: stop if output_offset has reached client's window limit.
             if (self.client_max_offset != std.math.maxInt(u32)) {
