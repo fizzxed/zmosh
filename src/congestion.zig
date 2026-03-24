@@ -1285,45 +1285,25 @@ pub const Bbr = struct {
 // Pacer
 // ---------------------------------------------------------------------------
 
-/// Hybrid credit-based pacer, inspired by picoquic's pacing.c.
+/// Hybrid leaky-bucket pacer (RFC 9002 §7.7, picoquic pacing.c).
 ///
-/// Uses a leaky bucket for inter-burst timing, but sends a quantum of
-/// packets as a back-to-back burst within each credit grant. This
-/// balances two competing needs:
-///
-/// - **Small bursts**: prevent router queue overflow (verified: zero
-///   loss below ~10 packets per burst on real network paths)
-/// - **Accurate bandwidth measurement**: keep send_elapsed small so
-///   BBR's delivery rate reflects link capacity, not pacing rate
-///
-/// References:
-/// - RFC 9002 §7.7 recommends a leaky bucket algorithm for pacing
-/// - picoquic's implementation: https://github.com/private-octopus/picoquic/blob/master/picoquic/pacing.c
+/// A credit bucket gates inter-burst timing. Within each burst, a
+/// quantum of packets sends back-to-back. The quantum is cwnd/4
+/// clamped to [2, 16] packets — small enough to avoid router queue
+/// overflow, large enough for accurate BBR bandwidth measurement.
 pub const Pacer = struct {
-    /// Initial burst allowance after idle, in packets.
     const initial_burst_packets: u32 = 10;
-    /// Minimum quantum: 2 packets (picoquic's 2*send_mtu floor).
     const min_quantum: u32 = 2 * max_datagram_size;
-    /// Maximum quantum: 16 packets (picoquic's 16*send_mtu cap).
     const max_quantum: u32 = 16 * max_datagram_size;
 
-    /// Accumulated send credit in nanoseconds.
     bucket_ns: i64 = 0,
-    /// Maximum bucket capacity. Limits burst after idle.
     bucket_max_ns: i64 = 0,
-    /// Timestamp of last credit refill.
     last_update_ns: i64 = 0,
-    /// Nanosecond cost of sending one quantum at current pacing rate.
     quantum_time_ns: i64 = 0,
-    /// Remaining bytes in current burst. Packets within a burst send
-    /// back-to-back without per-packet credit checks.
     burst_remaining: u32 = 0,
-    /// Current quantum in bytes. Derived from cwnd/4 (picoquic-style).
     quantum_bytes: u32 = initial_burst_packets * max_datagram_size,
 
-    /// Check if sending is allowed: either burst budget remains, or
-    /// the bucket has enough credit for the next quantum.
-    /// Set quantum from current cwnd (picoquic-style: cwnd/4, clamped).
+    /// Update quantum from current cwnd: cwnd/4 clamped to [2, 16] packets.
     pub fn setQuantum(self: *Pacer, cwnd: u32) void {
         self.quantum_bytes = @min(max_quantum, @max(min_quantum, cwnd / 4));
     }
@@ -1334,35 +1314,27 @@ pub const Pacer = struct {
         return self.quantum_time_ns == 0 or self.bucket_ns >= self.quantum_time_ns;
     }
 
-    /// Deduct credit for a sent packet. If this exhausts the current
-    /// burst, deduct a quantum from the bucket and grant a new burst.
     pub fn onSend(self: *Pacer, now: i64, packet_size: u32, pacing_rate: u64) void {
         self.updateRate(pacing_rate);
-
         if (self.burst_remaining >= packet_size) {
             self.burst_remaining -= packet_size;
             return;
         }
-
-        // Burst exhausted — deduct quantum cost from bucket, grant new burst.
         self.refill(now);
         self.bucket_ns -= self.quantum_time_ns;
         self.burst_remaining = self.quantum_bytes -| packet_size;
     }
 
-    /// Grant full burst credit after idle→active transition.
     pub fn onIdleRestart(self: *Pacer) void {
         self.bucket_ns = self.bucket_max_ns;
         self.burst_remaining = initial_burst_packets * max_datagram_size;
     }
 
-    /// Drain credit on loss to stop bursting during recovery.
     pub fn onLoss(self: *Pacer) void {
         self.bucket_ns = 0;
         self.burst_remaining = 0;
     }
 
-    /// Millisecond poll timeout: time until enough credit for next quantum.
     pub fn pollTimeoutMs(self: *Pacer, now: i64) i32 {
         if (self.burst_remaining > 0) return 0;
         self.refill(now);
@@ -1372,7 +1344,6 @@ pub const Pacer = struct {
         return @intCast(@max(@as(i64, 0), @min(ms, 1000)));
     }
 
-    /// Refill the bucket based on elapsed time since last update.
     fn refill(self: *Pacer, now: i64) void {
         if (self.last_update_ns == 0) {
             self.last_update_ns = now;
@@ -1384,7 +1355,6 @@ pub const Pacer = struct {
         self.bucket_ns = @min(self.bucket_ns + elapsed, self.bucket_max_ns);
     }
 
-    /// Update quantum cost and bucket capacity from current pacing rate.
     fn updateRate(self: *Pacer, pacing_rate: u64) void {
         if (pacing_rate == 0) {
             self.quantum_time_ns = 0;
@@ -1393,7 +1363,6 @@ pub const Pacer = struct {
         self.quantum_time_ns = @intCast(
             @as(u64, self.quantum_bytes) * ns_per_s / pacing_rate,
         );
-        // Bucket holds 2 quanta.
         self.bucket_max_ns = self.quantum_time_ns * 2;
     }
 };
