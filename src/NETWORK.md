@@ -76,8 +76,8 @@ Startup → Drain → ProbeBW (cycles: DOWN/CRUISE/REFILL/UP) → ProbeRTT → P
 
 | Parameter | Spec Value | zmosh Value | Rationale |
 |-----------|-----------|-------------|-----------|
-| `min_cwnd` | 4 × SMSS (4800 B) | **64 KB** | Terminal bursts (image previews) need larger floor |
-| `send_quantum` | `pacing_rate × 1ms` | Same | Per spec §5.6.3 |
+| `min_cwnd` | 4 × SMSS (4800 B) | Same | Spec value; flow control + backpressure handle bursts |
+| `send_quantum` | `pacing_rate × 1ms` | N/A | Replaced by credit-based pacer (see below) |
 | `packet_threshold` | 3 | 3 | Per RFC 9002 §6.1.1 |
 | `time_threshold` | 9/8 | 9/8 | Per RFC 9002 §6.1.2 |
 | `startup_pacing_gain` | 2.77 (4·ln2) | 2.77 | Per spec §2.4 |
@@ -100,26 +100,50 @@ A 1ms floor prevents degenerate rate estimates before the first RTT sample.
 
 1. **No ProbeRTT during Startup** — BBR would enter ProbeRTT 5 seconds after connection start, before bandwidth estimation stabilizes. Terminal sessions often have idle periods during startup (waiting for shell prompt) that look like ProbeRTT triggers.
 
-2. **64 KB min_cwnd** — A 400×400 PNG image preview via Kitty protocol is ~50-100 KB. At 4800-byte min_cwnd and 20ms RTT, loading takes 400ms. At 64 KB, it takes 30ms.
+2. **ProbeRTT suppression during bursts** — ProbeRTT crushes cwnd to min_cwnd (4800 bytes), which at typical RTTs causes ~500ms stalls when output is pending. The gateway sets `suppress_probe_rtt` when `pending_output > cwnd`, deferring ProbeRTT until the burst drains.
 
 3. **Flow-control pauses mark app-limited** — When the flow control window blocks sending, BBR must know the pause is receiver-imposed, not a bandwidth limit. Without this, BBR collapses its bandwidth estimate during pauses.
 
+4. **Idle-to-burst bandwidth probe** — BBR's ProbeBW waits 2-3 seconds between bandwidth probes. When terminal traffic transitions from idle to a large burst (e.g., image preview), the gateway triggers an early REFILL→UP probe cycle so BBR discovers the link's capacity within 1-2 RTTs instead of waiting seconds.
+
+5. **Startup inflight cap** — Before the client's first flow control window arrives, inflight is capped to `initial_cwnd` (12 KB). Without this, Startup's 2.77× pacing gain blasts hundreds of KB before the client can advertise its capacity.
+
 ## Pacer
 
-The pacer controls inter-packet spacing using `send_quantum` (spec §5.6.3):
+Credit-based leaky bucket, inspired by [picoquic's pacing.c](https://github.com/private-octopus/picoquic/blob/master/picoquic/pacing.c).
 
-```
-send_quantum = clamp(pacing_rate × 1ms, 2 × SMSS, 64 KB)
-```
+### Why not burst-based pacing?
 
-On each firing, the pacer grants `send_quantum` bytes as a burst budget. This amortizes `poll()` overhead (millisecond granularity) for sub-millisecond pacing intervals.
+The BBR spec (§5.6.3) uses `send_quantum` — a burst budget granted per timer tick. The application sends the entire quantum back-to-back, then sleeps. This works for TCP where the kernel paces individual segments at hardware-level granularity. For user-space UDP, the entire burst hits router queues simultaneously, causing packet loss on real network paths. We measured loss correlating with burst size: zero loss below ~8 packets per burst, 5%+ above ~10 packets.
 
-### Cwnd-Aware Bursting
+### Credit-based approach
 
-- **Cwnd-limited** (`inflight + packet >= cwnd`): single-packet burst
-- **Low bandwidth** (< 1.2 Mbps): single-packet burst
-- **Idle restart** (`inflight == 0`): grant 10-packet initial burst
-- **Loss**: clear burst budget
+Instead of granting a burst and sending all packets at once, the pacer maintains a nanosecond credit bucket:
+
+- **Refill**: credits accumulate based on elapsed wall-clock time
+- **Cost**: each packet costs `packet_size × 1e9 / pacing_rate` nanoseconds
+- **Gate**: `canSend()` checks credit ≥ cost before *every* `sendto()` call
+- **Deduct**: `onSend()` subtracts the packet's cost after sending
+
+This gates individual packets, not bursts. If the send loop is fast (~10μs per iteration), packets are naturally spaced at `packet_time` intervals — e.g., ~73μs apart at 15 MB/s. No sub-millisecond timer precision required; the wall clock refills credit between iterations.
+
+### Bucket capacity
+
+`bucket_max = packet_time × 10` (10 packets). This controls the maximum burst after idle — enough for the initial bandwidth probe without overwhelming router queues. After idle, the bucket fills to max. The first 10 packets send immediately; subsequent packets are paced.
+
+### Interaction with BBR
+
+BBR and the pacer are orthogonal but cooperative:
+- **BBR** decides the pacing rate (`bw × gain`) and the congestion window (cwnd)
+- **The pacer** enforces the pacing rate by gating individual packet sends
+- **The send loop** checks both: `bbr.canSend()` (inflight < cwnd) AND `pacer.canSend()` (credit available)
+- BBR updates `pacing_rate` on each ACK; the pacer reads it on each `onSend()`
+
+### Special states
+
+- **Idle restart**: fill bucket to max (10 packets of immediate burst)
+- **Loss**: drain bucket to zero (stop bursting during recovery)
+- **Poll timeout**: `(packet_time - bucket) / 1e6` ms until next send
 
 ## Loss Detection (RFC 9002)
 
@@ -163,8 +187,10 @@ This provides end-to-end backpressure adapted to the terminal's actual rendering
 ### Heartbeat Payload Format
 
 ```
-[AckRanges (7 + 4*num_gaps bytes)][max_offset: u32 big-endian]
+[AckRanges (7 + 4*num_gaps bytes)][max_offset: u32 BE][cumulative_ack: u32 BE]
 ```
+
+The `cumulative_ack` field (client's `next_offset`) tells the server that everything below this offset has been delivered. This is analogous to TCP's cumulative ACK. It prevents deadlocks when heavy loss creates more gaps than the 16-gap ACK range encoding can represent — without it, old acked packets fall outside the ACK window and the server retransmits them forever while the flow control window is closed.
 
 ## Output Reorder Buffer
 
@@ -181,6 +207,15 @@ The stale detection uses wrapping-aware comparison to distinguish old retransmit
 ## UDP Socket Buffers
 
 Both sides request 2 MB socket buffers (`SO_RCVBUF`/`SO_SNDBUF`). The kernel may clamp to `rmem_max`/`wmem_max`. This is defense-in-depth — the flow control window is the primary mechanism preventing receiver overflow.
+
+## Client ACK Policy
+
+QUIC-style (RFC 9000 §13.2):
+- ACK every 4 output packets (packet threshold)
+- ACK within 1ms if threshold not reached (delay timeout)
+- ACK immediately on out-of-order reception (fast loss detection)
+
+The client's `ack_delay` (1ms) can be shorter than the server's `max_ack_delay` (5ms) in the PTO calculation. The server's value is a worst-case assumption; the client sending faster is always safe.
 
 ## ACK Range Encoding
 

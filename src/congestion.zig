@@ -1293,103 +1293,99 @@ pub const Bbr = struct {
 // Pacer
 // ---------------------------------------------------------------------------
 
+/// Credit-based leaky bucket pacer, inspired by picoquic's pacing.c.
+///
+/// Instead of granting a burst budget and sending all packets at once,
+/// this pacer accumulates credit (in nanoseconds) based on elapsed time.
+/// Each packet costs `packet_size * 1e9 / pacing_rate` nanoseconds of
+/// credit. Sending is allowed only when the bucket has enough credit
+/// for one packet. This naturally spaces individual packets at the
+/// correct interval without requiring sub-millisecond timer precision.
+///
+/// The bucket has a maximum capacity (bucket_max_ns) that controls the
+/// maximum burst size after idle. Set to 10 packets' worth — enough
+/// for the initial probe without causing router queue overflow.
+///
+/// See: https://github.com/private-octopus/picoquic/blob/master/picoquic/pacing.c
 pub const Pacer = struct {
-    next_send_time: i64 = 0,
-    /// Remaining burst budget in bytes. When the pacer fires, it grants
-    /// send_quantum bytes that can be sent without per-packet pacing.
-    /// This amortizes poll() overhead (millisecond granularity) for sub-ms
-    /// pacing intervals. Matches QUIC implementations (quinn, quiche,
-    /// quic-go) that send aggregated bursts on each timer tick.
-    burst_remaining: u32 = 0,
+    /// Accumulated send credit in nanoseconds.
+    bucket_ns: i64 = 0,
+    /// Maximum bucket capacity: limits burst size after idle.
+    /// 10 packets matches the initial_cwnd probe size.
+    bucket_max_ns: i64 = 0,
+    /// Timestamp of last credit refill.
+    last_update_ns: i64 = 0,
+    /// Nanosecond cost of sending one max_datagram_size packet.
+    /// Updated when pacing_rate changes. 0 = no pacing (send freely).
+    packet_time_ns: i64 = 0,
 
-    /// Low bandwidth threshold below which bursting is limited to 1 packet.
-    /// Matches Cloudflare quiche's LUMPY_PACING_MIN_BANDWIDTH_KBPS = 1.2 Mbps.
-    const low_bw_threshold: u64 = 150_000; // 1.2 Mbps = 150 KB/s
-
-    /// Initial burst size after quiescence (idle → sending), in packets.
-    /// Matches Cloudflare quiche's INITIAL_UNPACED_BURST = 10.
+    /// Initial burst allowance after idle, in packets.
     const initial_burst_packets: u32 = 10;
 
-    pub fn canSend(self: *const Pacer, now: i64) bool {
-        return self.burst_remaining > 0 or now >= self.next_send_time;
+    /// Check if there's enough credit to send one packet.
+    /// Refills the bucket based on elapsed time before checking.
+    pub fn canSend(self: *Pacer, now: i64) bool {
+        self.refill(now);
+        return self.packet_time_ns == 0 or self.bucket_ns >= self.packet_time_ns;
     }
 
-    pub fn onSend(self: *Pacer, now: i64, packet_size: u32, pacing_rate: u64, inflight: u32, cwnd: u32) void {
-        if (self.burst_remaining >= packet_size) {
-            self.burst_remaining -= packet_size;
-            return;
-        }
-        self.burst_remaining = 0;
+    /// Deduct credit for a sent packet and update pacing parameters.
+    pub fn onSend(self: *Pacer, now: i64, packet_size: u32, pacing_rate: u64) void {
+        self.refill(now);
+        self.updateRate(pacing_rate);
 
-        // Determine burst size based on congestion state:
-        // - Cwnd-limited: single packet (don't overshoot the window)
-        // - Low bandwidth: single packet (~10ms of queuing per packet)
-        // - Normal: full send_quantum per spec §5.6.3
-        const quantum = if (inflight +| packet_size >= cwnd)
-            packet_size // cwnd-limited
-        else if (pacing_rate < low_bw_threshold)
-            packet_size // low bandwidth
-        else
-            sendQuantum(pacing_rate);
+        if (self.packet_time_ns == 0) return;
 
-        if (pacing_rate == 0) {
-            self.next_send_time = now;
-            self.burst_remaining = quantum -| packet_size;
-            return;
-        }
-
-        // Schedule next burst after quantum bytes worth of pacing time.
-        const burst_interval_ns: i64 = @intCast(@as(u64, quantum) * ns_per_s / pacing_rate);
-
-        if (now >= self.next_send_time) {
-            self.next_send_time = now + burst_interval_ns;
-        } else {
-            self.next_send_time += burst_interval_ns;
-        }
-        self.burst_remaining = quantum -| packet_size;
+        // Cost scales with actual packet size relative to max datagram.
+        const cost: i64 = @intCast(
+            @as(u64, @intCast(self.packet_time_ns)) * packet_size / max_datagram_size,
+        );
+        self.bucket_ns -= cost;
     }
 
-    /// Grant an initial burst after quiescence (connection was idle).
-    /// Matches Cloudflare quiche's INITIAL_UNPACED_BURST = 10 packets.
+    /// Grant full burst credit after idle→active transition.
     pub fn onIdleRestart(self: *Pacer) void {
-        self.burst_remaining = initial_burst_packets * max_datagram_size;
+        self.bucket_ns = self.bucket_max_ns;
     }
 
-    /// Clear burst budget on loss (stop bursting during recovery).
+    /// Drain credit on loss to stop bursting during recovery.
     pub fn onLoss(self: *Pacer) void {
-        self.burst_remaining = 0;
+        self.bucket_ns = 0;
     }
 
-    /// BBRSetSendQuantum (spec §5.6.3), adapted for UDP:
-    ///   C.send_quantum = C.pacing_rate * 1ms
-    ///   C.send_quantum = min(C.send_quantum, max_burst)
-    ///   C.send_quantum = max(C.send_quantum, 2 * C.SMSS)
-    /// Spec allows up to 64KB, but UDP packets are individual datagrams
-    /// that arrive at routers as discrete bursts (unlike TCP segments
-    /// which are paced by the kernel). Large bursts cause queue overflow
-    /// and packet loss on real network paths. Cap to 5 packets.
-    fn sendQuantum(pacing_rate: u64) u32 {
-        const floor = 2 * max_datagram_size; // 2 SMSS
-        const max_burst = 5 * max_datagram_size; // 5 packets
-        if (pacing_rate == 0) return floor;
-        // pacing_rate (bytes/sec) * 1ms = pacing_rate / 1000
-        const dynamic: u64 = pacing_rate / 1000;
-        return @intCast(@min(max_burst, @max(floor, dynamic)));
-    }
-
-    pub fn pollTimeoutMs(self: *const Pacer, now: i64) i32 {
-        if (self.burst_remaining > 0 or now >= self.next_send_time) return 0;
-        const remaining_ns = self.next_send_time - now;
-        const ms = @divFloor(remaining_ns, std.time.ns_per_ms);
+    /// Millisecond poll timeout: time until enough credit for one packet.
+    pub fn pollTimeoutMs(self: *Pacer, now: i64) i32 {
+        self.refill(now);
+        if (self.packet_time_ns == 0 or self.bucket_ns >= self.packet_time_ns) return 0;
+        const deficit_ns = self.packet_time_ns - self.bucket_ns;
+        const ms = @divFloor(deficit_ns, std.time.ns_per_ms);
         return @intCast(@max(@as(i64, 0), @min(ms, 1000)));
     }
 
-    /// Nanosecond-precision timeout for ppoll(). Returns the time until
-    /// the next send is allowed, or 0 if sending is allowed now.
-    pub fn pollTimeoutNs(self: *const Pacer, now: i64) i64 {
-        if (self.burst_remaining > 0 or now >= self.next_send_time) return 0;
-        const remaining_ns = self.next_send_time - now;
-        return @max(remaining_ns, 0);
+    /// Refill the bucket based on elapsed time since last update.
+    fn refill(self: *Pacer, now: i64) void {
+        if (self.last_update_ns == 0) {
+            self.last_update_ns = now;
+            return;
+        }
+        const elapsed = now - self.last_update_ns;
+        if (elapsed <= 0) return;
+        self.last_update_ns = now;
+        self.bucket_ns = @min(self.bucket_ns + elapsed, self.bucket_max_ns);
+    }
+
+    /// Update per-packet cost and bucket capacity from current pacing rate.
+    fn updateRate(self: *Pacer, pacing_rate: u64) void {
+        if (pacing_rate == 0) {
+            self.packet_time_ns = 0;
+            return;
+        }
+        // Time to send one max_datagram_size packet at pacing_rate.
+        self.packet_time_ns = @intCast(
+            @as(u64, max_datagram_size) * ns_per_s / pacing_rate,
+        );
+        // Bucket holds up to initial_burst_packets worth of credit.
+        self.bucket_max_ns = self.packet_time_ns * initial_burst_packets;
     }
 };
 

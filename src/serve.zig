@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const posix = std.posix;
 const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
@@ -320,25 +319,11 @@ pub const Gateway = struct {
             }
             poll_fds[1] = .{ .fd = self.unix_fd, .events = unix_events, .revents = 0 };
 
-            const poll_timeout_ns = self.computePollTimeoutNs(now);
-            // Use ppoll (nanosecond precision) on Linux for sub-ms pacing.
-            // Fall back to poll (millisecond precision) on macOS/others.
-            if (comptime builtin.os.tag == .linux) {
-                const ts = posix.timespec{
-                    .sec = @intCast(@divFloor(poll_timeout_ns, std.time.ns_per_s)),
-                    .nsec = @intCast(@mod(poll_timeout_ns, std.time.ns_per_s)),
-                };
-                _ = posix.ppoll(&poll_fds, &ts, null) catch |err| {
-                    if (err == error.SignalInterrupt) continue;
-                    return err;
-                };
-            } else {
-                const poll_ms: i32 = @intCast(@max(@as(i64, 0), @divFloor(poll_timeout_ns, std.time.ns_per_ms)));
-                _ = posix.poll(&poll_fds, poll_ms) catch |err| {
-                    if (err == error.Interrupted) continue;
-                    return err;
-                };
-            }
+            const poll_timeout = self.computePollTimeoutMs(now);
+            _ = posix.poll(&poll_fds, poll_timeout) catch |err| {
+                if (err == error.Interrupted) continue;
+                return err;
+            };
 
             // Handle incoming UDP datagrams → decrypt → decode transport packet
             if (poll_fds[0].revents & posix.POLL.IN != 0) {
@@ -401,14 +386,14 @@ pub const Gateway = struct {
         }
     }
 
-    fn computePollTimeoutNs(self: *const Gateway, now: i64) i64 {
-        var timeout: i64 = @min(@as(i64, self.config.heartbeat_interval_ms), 1000) * std.time.ns_per_ms;
+    fn computePollTimeoutMs(self: *Gateway, now: i64) i32 {
+        var timeout: i64 = @min(@as(i64, self.config.heartbeat_interval_ms), 1000);
 
-        // Pacer timeout for pending output (nanosecond precision)
+        // Pacer timeout for pending output
         if (self.pending_output.items.len > 0 or self.retransmit_queue.items.len > 0) {
             if (self.bbr.canSend()) {
-                const pacer_ns = self.pacer.pollTimeoutNs(now);
-                timeout = @min(timeout, pacer_ns);
+                const pacer_ms = self.pacer.pollTimeoutMs(now);
+                timeout = @min(timeout, @as(i64, pacer_ms));
             }
         }
 
@@ -416,17 +401,18 @@ pub const Gateway = struct {
         const timer = if (self.loss_time > 0) self.loss_time else if (self.pto_time > 0) self.pto_time else @as(i64, 0);
         if (timer > 0) {
             const remaining_ns = timer - now;
-            timeout = @min(timeout, if (remaining_ns > 0) remaining_ns else 0);
+            const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
+            timeout = @min(timeout, remaining_ms);
         }
 
         if (self.reliable_send.hasPending()) {
-            const rto_ns = self.peer.rto_us() * std.time.ns_per_us;
-            timeout = @min(timeout, @max(@as(i64, 1000), rto_ns));
+            const rto_ms = @divFloor(self.peer.rto_us(), 1000);
+            timeout = @min(timeout, @max(@as(i64, 1), rto_ms));
         }
 
-        if (self.ack_dirty) timeout = @min(timeout, 20 * std.time.ns_per_ms);
+        if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
 
-        return @max(timeout, 0);
+        return @intCast(@max(@as(i64, 0), timeout));
     }
 
     fn sendHeartbeat(self: *Gateway, now: i64) !void {
@@ -490,7 +476,7 @@ pub const Gateway = struct {
             // decremented it. Re-incrementing causes drift: if markAcked
             // returns null (already acked from original), onAckPacket
             // won't decrement, and inflight grows unboundedly.
-            self.pacer.onSend(now, @intCast(rtx_payload.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
+            self.pacer.onSend(now, @intCast(rtx_payload.len), self.bbr.pacing_rate);
         }
 
         // New data (subject to cwnd, pacer, and flow control)
@@ -498,8 +484,17 @@ pub const Gateway = struct {
             // New data from pending_output
             if (self.pending_output.items.len == 0) break;
 
+            // Before the client's first flow control window arrives, cap inflight
+            // to initial_cwnd. Without this, Startup's 2.77x pacing gain blasts
+            // hundreds of KB into the network before the client can advertise its
+            // capacity, causing massive packet loss at router queues.
+            if (self.client_max_offset == std.math.maxInt(u32) and
+                self.bbr.inflight >= congestion.initial_cwnd)
+            {
+                break;
+            }
+
             // Flow control: stop if output_offset has reached client's window limit.
-            // Skip check when client hasn't advertised yet (max_offset = maxInt).
             if (self.client_max_offset != std.math.maxInt(u32)) {
                 const flow_room = self.client_max_offset -% self.output_offset;
                 if (flow_room == 0 or flow_room >= 0x80000000) break;
@@ -532,10 +527,10 @@ pub const Gateway = struct {
                 return err;
             };
 
-            debugWrite(self.debug_log, "SEND off={d} len={d} infl={d} cwnd={d} pend={d} burst={d}\n", .{
-                offset, chunk.len, self.bbr.inflight, self.bbr.cwnd, self.pending_output.items.len - end, self.pacer.burst_remaining,
+            debugWrite(self.debug_log, "SEND off={d} len={d} infl={d} cwnd={d} pend={d}\n", .{
+                offset, chunk.len, self.bbr.inflight, self.bbr.cwnd, self.pending_output.items.len - end,
             });
-            self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate, self.bbr.inflight, self.bbr.cwnd);
+            self.pacer.onSend(now, @intCast(chunk.len), self.bbr.pacing_rate);
             self.output_offset +%= transport.step;
             // Remove sent data from pending buffer
             self.pending_output.replaceRange(self.alloc, 0, end, &[_]u8{}) catch unreachable;
