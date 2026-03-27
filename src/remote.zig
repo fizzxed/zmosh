@@ -124,8 +124,10 @@ pub fn connectRemote(alloc: std.mem.Allocator, host: []const u8, session: []cons
         child.stdout = null;
     }
 
+    const gateway_host = try alloc.dupe(u8, result.host);
+
     return .{
-        .host = result.host,
+        .host = gateway_host,
         .port = result.port,
         .key = result.key,
     };
