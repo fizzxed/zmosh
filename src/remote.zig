@@ -369,9 +369,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             const due_by_time = (now - last_output_ack_ns) >= output_ack_min_interval_ns;
             const due_by_count = unacked_output_count >= output_ack_max_unacked;
             if (due_by_time or due_by_count) {
-                var ack_buf: [12]u8 = undefined;
-                const peer_time_us: u32 = @truncate(@as(u64, @intCast(@divFloor(now, std.time.ns_per_us))));
-                const ack_payload = transport.buildOutputAckPayload(highest_output_seq, received_output_seqs, peer_time_us, &ack_buf);
+                var ack_buf: [8]u8 = undefined;
+                const ack_payload = transport.buildOutputAckPayload(highest_output_seq, received_output_seqs, &ack_buf);
                 var pkt_buf: [64]u8 = undefined;
                 const pkt = transport.buildUnreliable(.output_ack, 0, reliable_recv.ack(), reliable_recv.ackBits(), ack_payload, &pkt_buf) catch unreachable;
                 peer.send(&udp_sock, pkt) catch {};

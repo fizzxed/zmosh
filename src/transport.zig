@@ -18,28 +18,24 @@ pub const Channel = enum(u8) {
 ///
 /// `ack_seq` is the highest output seq the client has received. `ack_bits`
 /// bit `i` (i in 0..31) is set when seq `(ack_seq - 1 - i)` was also
-/// received. `peer_time_us` is the lower 32 bits of the client's monotonic
-/// clock when the ack was emitted (informational; not used by serve.zig
-/// today, kept for symmetry with QUIC ack-delay).
+/// received. RTT is derived server-side from the sent-packet ring slot, so
+/// no per-ack timestamp is carried on the wire.
 pub const OutputAckPayload = extern struct {
     ack_seq: u32,
     ack_bits: u32,
-    peer_time_us: u32,
 };
 
-pub fn buildOutputAckPayload(ack_seq: u32, ack_bits: u32, peer_time_us: u32, out: *[12]u8) []const u8 {
+pub fn buildOutputAckPayload(ack_seq: u32, ack_bits: u32, out: *[8]u8) []const u8 {
     std.mem.writeInt(u32, out[0..4], ack_seq, .big);
     std.mem.writeInt(u32, out[4..8], ack_bits, .big);
-    std.mem.writeInt(u32, out[8..12], peer_time_us, .big);
-    return out[0..12];
+    return out[0..8];
 }
 
 pub fn parseOutputAckPayload(payload: []const u8) ?OutputAckPayload {
-    if (payload.len < 12) return null;
+    if (payload.len < 8) return null;
     return .{
         .ack_seq = std.mem.readInt(u32, payload[0..4], .big),
         .ack_bits = std.mem.readInt(u32, payload[4..8], .big),
-        .peer_time_us = std.mem.readInt(u32, payload[8..12], .big),
     };
 }
 
@@ -362,18 +358,17 @@ test "reliable recv window" {
 }
 
 test "output_ack payload round trip" {
-    var buf: [12]u8 = undefined;
-    const payload = buildOutputAckPayload(1234, 0xDEADBEEF, 0xCAFEBABE, &buf);
+    var buf: [8]u8 = undefined;
+    const payload = buildOutputAckPayload(1234, 0xDEADBEEF, &buf);
     const parsed = parseOutputAckPayload(payload).?;
     try std.testing.expectEqual(@as(u32, 1234), parsed.ack_seq);
     try std.testing.expectEqual(@as(u32, 0xDEADBEEF), parsed.ack_bits);
-    try std.testing.expectEqual(@as(u32, 0xCAFEBABE), parsed.peer_time_us);
 
     // ack_bits with gaps (e.g. seqs 100, 98, 95 received -> ack_seq=100,
     // bit 1 (=98) and bit 4 (=95) set in ack_bits).
-    var buf2: [12]u8 = undefined;
+    var buf2: [8]u8 = undefined;
     const gap_bits: u32 = (@as(u32, 1) << 1) | (@as(u32, 1) << 4);
-    const p2 = buildOutputAckPayload(100, gap_bits, 0, &buf2);
+    const p2 = buildOutputAckPayload(100, gap_bits, &buf2);
     const parsed2 = parseOutputAckPayload(p2).?;
     try std.testing.expectEqual(gap_bits, parsed2.ack_bits);
 }
