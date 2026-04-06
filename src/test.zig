@@ -5,4 +5,5 @@ comptime {
     _ = @import("crypto.zig");
     _ = @import("udp.zig");
     _ = @import("transport.zig");
+    _ = @import("c4.zig");
 }
