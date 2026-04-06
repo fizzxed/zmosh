@@ -29,7 +29,7 @@ const bash_completions =
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
     \\  prev="${COMP_WORDS[COMP_CWORD-1]}"
     \\
-    \\  local commands="attach run detach list completions kill history version help"
+    \\  local commands="attach run serve detach list completions kill history version help"
     \\
     \\  if [[ $COMP_CWORD -eq 1 ]]; then
     \\    COMPREPLY=($(compgen -W "$commands" -- "$cur"))
@@ -37,7 +37,7 @@ const bash_completions =
     \\  fi
     \\
     \\  case "$prev" in
-    \\    attach|run|kill|history)
+    \\    attach|run|serve|kill|history)
     \\      local sessions=$(zmosh list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
@@ -72,6 +72,7 @@ const zsh_completions =
     \\      commands=(
     \\        'attach:Attach to session, creating if needed'
     \\        'run:Send command without attaching'
+    \\        'serve:Start UDP gateway for remote access'
     \\        'detach:Detach all clients from current session'
     \\        'list:List active sessions'
     \\        'completions:Shell completion scripts'
@@ -84,7 +85,7 @@ const zsh_completions =
     \\      ;;
     \\    args)
     \\      case $words[2] in
-    \\        attach|a|kill|k|run|r|history|hi)
+    \\        attach|a|kill|k|run|r|serve|s|history|hi)
     \\          _zmosh_sessions
     \\          ;;
     \\        completions|c)
@@ -120,6 +121,7 @@ const fish_completions =
     \\
     \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, creating if needed'
     \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'r run' -d 'Send command without attaching'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 's serve' -d 'Start UDP gateway for remote access'
     \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from current session'
     \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'l list' -d 'List active sessions'
     \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'c completions' -d 'Shell completion scripts'
@@ -131,7 +133,7 @@ const fish_completions =
     \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'h help' -d 'Show help message'
     \\complete -c zmosh -s h -d 'Show help message'
     \\
-    \\complete -c zmosh -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run k kill hi history w wait" -a '(zmosh list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmosh -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run s serve k kill hi history w wait" -a '(zmosh list --short 2>/dev/null)' -d 'Session name'
     \\
     \\complete -c zmosh -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish' -d Shell
     \\
