@@ -845,6 +845,109 @@ test "delay excess triggers congestion notification" {
     try testing.expectEqual(AlgState.recovery, st.alg_state);
 }
 
+test "C4 unwedges from initial when bandwidth_estimate_bps is fed" {
+    // Reproduces the wedge: prior to commit 1, ctx.bandwidth_estimate_bps
+    // stayed 0 forever, so handleAck never set state.nominal_rate, so
+    // exitInitial bailed early. With the cc-layer fix in place, a synthetic
+    // sequence that supplies a non-zero bandwidth estimate must drive C4
+    // through initial -> recovery -> cruising -> pushing -> recovery.
+    var hooks = TestHooks{};
+    var ctx = makeCtx(&hooks);
+    var st = State{};
+    reset(&st, &ctx, 0);
+
+    try testing.expectEqual(AlgState.initial, st.alg_state);
+
+    // Drive era boundaries with a healthy bandwidth estimate; nominal_rate
+    // should latch to the measured rate, then after 3 no-increase eras the
+    // state machine exits initial.
+    // Feed bandwidth_estimate_bps so handleAck latches a non-zero
+    // nominal_rate (the pre-fix wedge). This is the critical step that
+    // would have failed before commit 1: ctx.bandwidth_estimate_bps was
+    // 0, so state.nominal_rate stayed 0, so exitInitial bailed out.
+    ctx.bandwidth_estimate_bps = 800_000;
+
+    var i: u32 = 0;
+    while (i < 12 and st.alg_state == .initial) : (i += 1) {
+        hooks.lowest_not_ack = st.era_sequence + 10;
+        hooks.next_seq = st.era_sequence + 10;
+        // Hold push_was_not_limited high so the no-increase counter ticks
+        // (the synthetic harness has no real RTT/delivery flow).
+        st.push_was_not_limited = true;
+        const ack = AckState{
+            .rtt_measurement_us = 20_000,
+            .nb_bytes_delivered_since_packet_sent = 1500,
+            .nb_bytes_acknowledged = 1500,
+        };
+        notifyAck(&st, &ctx, ack, 0);
+    }
+    try testing.expect(st.nominal_rate > 0); // pre-fix wedge: this stayed 0
+    try testing.expect(st.alg_state != .initial);
+
+    // Walk forward — under steady acks the machine should reach pushing
+    // and then bounce back to recovery.
+    var saw_cruising = false;
+    var saw_pushing = false;
+    var saw_recovery_after = false;
+    var safety: u32 = 0;
+    while (safety < 30) : (safety += 1) {
+        if (st.alg_state == .cruising) saw_cruising = true;
+        if (st.alg_state == .pushing) saw_pushing = true;
+        if (saw_pushing and st.alg_state == .recovery) {
+            saw_recovery_after = true;
+            break;
+        }
+        hooks.lowest_not_ack = st.era_sequence + 10;
+        hooks.next_seq = st.era_sequence + 10;
+        const ack = AckState{
+            .rtt_measurement_us = 20_000,
+            .nb_bytes_delivered_since_packet_sent = 1500,
+            .nb_bytes_acknowledged = 1500,
+        };
+        notifyAck(&st, &ctx, ack, 0);
+    }
+    try testing.expect(saw_cruising);
+    try testing.expect(saw_pushing);
+    try testing.expect(saw_recovery_after);
+}
+
+test "C4 cruising -> recovery on synthetic loss with rate decrease" {
+    var hooks = TestHooks{};
+    var ctx = makeCtx(&hooks);
+    var st = State{};
+    reset(&st, &ctx, 0);
+
+    st.alg_state = .cruising;
+    st.nominal_rate = 5_000_000; // well above sensitivity floor
+    st.nominal_max_rtt_us = 20_000;
+    st.alpha_1024_current = alpha_cruise_1024;
+    // Force loss-rate above lossThreshold by hand.
+    st.smoothed_drop_rate = 0.9;
+
+    const before = st.nominal_rate;
+    notifyLoss(&st, &ctx, 100, 0);
+    try testing.expectEqual(AlgState.recovery, st.alg_state);
+    try testing.expect(st.nominal_rate < before);
+}
+
+test "C4 delay excess in cruising enters recovery" {
+    var hooks = TestHooks{};
+    var ctx = makeCtx(&hooks);
+    var st = State{};
+    reset(&st, &ctx, 0);
+
+    st.alg_state = .cruising;
+    st.nominal_rate = 5_000_000;
+    st.nominal_max_rtt_us = 20_000;
+    st.delay_threshold_us = 5_000;
+    st.alpha_1024_previous = alpha_push_1024;
+    st.alpha_1024_current = alpha_cruise_1024;
+
+    ctx.rtt_sample_us = 200_000;
+    notifyRtt(&st, &ctx, 200_000, 0);
+    try testing.expectEqual(AlgState.recovery, st.alg_state);
+}
+
 test "recovery -> cruising -> pushing -> recovery under healthy link" {
     var hooks = TestHooks{};
     var ctx = makeCtx(&hooks);
