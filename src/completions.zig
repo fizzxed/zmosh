@@ -23,7 +23,7 @@ pub const Shell = enum {
 };
 
 const bash_completions =
-    \\_zmx_completions() {
+    \\_zmosh_completions() {
     \\  local cur prev words cword
     \\  COMPREPLY=()
     \\  cur="${COMP_WORDS[COMP_CWORD]}"
@@ -38,7 +38,7 @@ const bash_completions =
     \\
     \\  case "$prev" in
     \\    attach|run|kill|history)
-    \\      local sessions=$(zmx list --short 2>/dev/null | tr '\n' ' ')
+    \\      local sessions=$(zmosh list --short 2>/dev/null | tr '\n' ' ')
     \\      COMPREPLY=($(compgen -W "$sessions" -- "$cur"))
     \\      ;;
     \\    completions)
@@ -52,11 +52,11 @@ const bash_completions =
     \\  esac
     \\}
     \\
-    \\complete -o bashdefault -o default -F _zmx_completions zmx
+    \\complete -o bashdefault -o default -F _zmosh_completions zmosh
 ;
 
 const zsh_completions =
-    \\_zmx() {
+    \\_zmosh() {
     \\  local context state state_descr line
     \\  typeset -A opt_args
     \\
@@ -85,7 +85,7 @@ const zsh_completions =
     \\    args)
     \\      case $words[2] in
     \\        attach|a|kill|k|run|r|history|hi)
-    \\          _zmx_sessions
+    \\          _zmosh_sessions
     \\          ;;
     \\        completions|c)
     \\          _values 'shell' 'bash' 'zsh' 'fish'
@@ -101,10 +101,10 @@ const zsh_completions =
     \\  esac
     \\}
     \\
-    \\_zmx_sessions() {
+    \\_zmosh_sessions() {
     \\  local -a sessions
     \\
-    \\  local local_sessions=$(zmx list --short 2>/dev/null)
+    \\  local local_sessions=$(zmosh list --short 2>/dev/null)
     \\  if [[ -n "$local_sessions" ]]; then
     \\    sessions+=(${(f)local_sessions})
     \\  fi
@@ -112,30 +112,30 @@ const zsh_completions =
     \\  _describe 'local session' sessions
     \\}
     \\
-    \\compdef _zmx zmx
+    \\compdef _zmosh zmosh
 ;
 
 const fish_completions =
-    \\complete -c zmx -f
+    \\complete -c zmosh -f
     \\
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, creating if needed'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'r run' -d 'Send command without attaching'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from current session'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'l list' -d 'List active sessions'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'c completions' -d 'Shell completion scripts'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'hi history' -d 'Output session scrollback'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'v version' -d 'Show version'
-    \\complete -c zmx -s v -l version -d 'Show version'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for session tasks to complete'
-    \\complete -c zmx -n "__fish_is_nth_token 1" -a 'h help' -d 'Show help message'
-    \\complete -c zmx -s h -d 'Show help message'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'a attach' -d 'Attach to session, creating if needed'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'r run' -d 'Send command without attaching'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'd detach' -d 'Detach all clients from current session'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'l list' -d 'List active sessions'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'c completions' -d 'Shell completion scripts'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'k kill' -d 'Kill a session'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'hi history' -d 'Output session scrollback'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'v version' -d 'Show version'
+    \\complete -c zmosh -s v -l version -d 'Show version'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'w wait' -d 'Wait for session tasks to complete'
+    \\complete -c zmosh -n "__fish_is_nth_token 1" -a 'h help' -d 'Show help message'
+    \\complete -c zmosh -s h -d 'Show help message'
     \\
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run k kill hi history w wait" -a '(zmx list --short 2>/dev/null)' -d 'Session name'
+    \\complete -c zmosh -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from a attach r run k kill hi history w wait" -a '(zmosh list --short 2>/dev/null)' -d 'Session name'
     \\
-    \\complete -c zmx -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish' -d Shell
+    \\complete -c zmosh -n "__fish_is_nth_token 2; and __fish_seen_subcommand_from c completions" -a 'bash zsh fish' -d Shell
     \\
-    \\complete -c zmx -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
-    \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
-    \\complete -c zmx -n "__fish_seen_subcommand_from hi history" -l html -d 'History format for escape sequences'
+    \\complete -c zmosh -n "__fish_seen_subcommand_from l list" -l short -d 'Short output'
+    \\complete -c zmosh -n "__fish_seen_subcommand_from hi history" -l vt -d 'History format for escape sequences'
+    \\complete -c zmosh -n "__fish_seen_subcommand_from hi history" -l html -d 'History format for escape sequences'
 ;
