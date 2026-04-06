@@ -5,19 +5,52 @@
 //! onAck, onLoss, canSend) and a set of ambient measurements. In return it
 //! gets a CWND + pacer that tracks how fast it should be sending.
 //!
-//! Sent packets are tracked in a 256-slot ring keyed by byte-offset range.
-//! That's enough for the server->client output channel: at MTU-sized
-//! packets this covers ~280 KiB in flight, well above any CWND C4 is
-//! likely to compute for a terminal session.
+//! Sent packets are tracked in a 2048-slot ring keyed by byte-offset range.
+//! That's enough for any realistic BDP on the paths zmosh actually runs
+//! over: at MTU-sized packets (1100 B) the ring holds ~2.2 MiB of
+//! in-flight bytes. Sizing worked from bandwidth × RTT:
 //!
-//! The ring is indexed by `(write_counter % ring_slots)`. Lookups by byte
-//! offset are linear scans bounded by `ring_slots`.
+//!   Gigabit LAN (120 MB/s × 1 ms)    = 120 KB  ≈ 109 packets
+//!   100 Mbps home (12 MB/s × 50 ms)  = 600 KB  ≈ 545 packets
+//!   Coast-to-coast (10 MB/s × 100ms) = 1 MB    ≈ 909 packets
+//!   International (5 MB/s × 150 ms)  = 750 KB  ≈ 682 packets
+//!
+//! At 256 slots (the original sizing) any WAN burst would silently overflow
+//! and evict live slots — C4 would lose feedback for the oldest in-flight
+//! packets, biasing delivery-rate estimation and never seeing RTT samples
+//! for them. 2048 covers everything short of satellite-class links and
+//! matches the server-side retransmit ring sizing in serve.zig.
+//!
+//! The ring is indexed by `(write_counter % ring_slots)`. Because
+//! `ring_write` is monotonic and each `onPacketSent` records an offset
+//! strictly higher than the previous, insertion order == offset order.
+//! Walking the ring in insertion order yields a sorted stream over in-use
+//! slots (modulo wrap). `ackRange` exploits this: one linear pass retires
+//! every slot fully inside an ack range, instead of calling `findSlot`
+//! (O(ring_slots)) once per retired slot.
+//!
+//! Memory: ~50 bytes per SentInfo × 2048 ≈ 100 KB per session. Trivial.
+//!
+//! ### findSlot's exact-match invariant
+//!
+//! `findSlot` uses `slot.offset_start == target` (not range overlap). This
+//! assumes every ack coming back references an offset that some slot
+//! was originally recorded with — i.e. retransmits always reuse the same
+//! `offset_start` and `length` as the original. serve.zig enforces this
+//! by re-sending from the stored retransmit-ring payload verbatim.
+//!
+//! If we ever add "retransmit coalescing" (combining multiple lost
+//! chunks into one bigger retransmit) or "retransmit splitting" (PMTU
+//! drop forces smaller chunks), the invariant breaks and `findSlot` will
+//! silently drop acks. At that point switch to range-overlap matching
+//! using the `length` parameter (which is already plumbed through the
+//! API for this future change). See TODO in `findSlot`.
 
 const std = @import("std");
 const c4 = @import("c4.zig");
 const pacer_mod = @import("pacer.zig");
 
-pub const ring_slots: usize = 256;
+pub const ring_slots: usize = 2048;
 
 const SentInfo = struct {
     offset_start: u64 = 0,
@@ -133,6 +166,12 @@ pub const CongestionController = struct {
         self.pacer.onSent(length);
     }
 
+    /// Find a slot by exact offset_start. O(ring_slots) linear scan.
+    ///
+    /// Exact-match invariant: callers must pass an `offset_start` that was
+    /// used verbatim in a previous `onPacketSent` call — i.e. retransmits
+    /// must preserve the original offset AND length. See module docstring
+    /// for the implications if this ever needs to change.
     fn findSlot(self: *CongestionController, offset_start: u64) ?*SentInfo {
         for (&self.ring) |*slot| {
             if (!slot.in_use) continue;
@@ -141,20 +180,13 @@ pub const CongestionController = struct {
         return null;
     }
 
-    pub fn onAck(
-        self: *CongestionController,
-        offset_start: u64,
-        length: u32,
-        rtt_us: u64,
-        now_us: u64,
-    ) void {
-        _ = length;
-        const slot = self.findSlot(offset_start) orelse return;
-
+    /// Process the feedback for one acked slot. Updates bytes_in_transit,
+    /// delivery-rate estimates, RTT smoothing, and notifies C4. The caller
+    /// owns finding the slot and marking it not-in-use.
+    fn processSlotAck(self: *CongestionController, slot: *SentInfo, rtt_us: u64, now_us: u64) void {
         const size = slot.length;
         const send_time = slot.send_time_us;
         const delivered_at_send = slot.total_delivered_bytes_at_send_time;
-        slot.in_use = false;
 
         if (self.ctx.bytes_in_transit >= size) {
             self.ctx.bytes_in_transit -= size;
@@ -211,6 +243,53 @@ pub const CongestionController = struct {
         };
         c4.notifyAck(&self.state, &self.ctx, ack_state, now_us);
         if (rtt_us > 0) c4.notifyRtt(&self.state, &self.ctx, rtt_us, now_us);
+    }
+
+    /// Single-offset ack path, used for the gap entries of a SACK (where
+    /// each gap targets a specific chunk). For the contiguous prefix of a
+    /// SACK, prefer `ackRange` — it's a single linear scan over the ring
+    /// rather than one scan per retired slot.
+    pub fn onAck(
+        self: *CongestionController,
+        offset_start: u64,
+        length: u32,
+        rtt_us: u64,
+        now_us: u64,
+    ) void {
+        _ = length;
+        const slot = self.findSlot(offset_start) orelse return;
+        slot.in_use = false;
+        self.processSlotAck(slot, rtt_us, now_us);
+    }
+
+    /// Bulk ack: retire every in-use slot whose byte range lies entirely
+    /// within `[lo, hi)`. Walks the ring once; cost is O(ring_slots),
+    /// independent of how many slots are retired.
+    ///
+    /// This is the picoquic-style "walk adjacent entries after finding the
+    /// range" optimization, adapted to a fixed ring: because insertion
+    /// order matches offset order, every slot in the target range is
+    /// already "adjacent" in the ring and we don't need a findSlot-per-
+    /// retirement loop.
+    ///
+    /// Each retired slot gets its own per-packet RTT derived from
+    /// `now_us - slot.send_time_us`, so RTT fidelity matches the old
+    /// single-ack path.
+    pub fn ackRange(self: *CongestionController, lo: u64, hi: u64, now_us: u64) void {
+        if (hi <= lo) return;
+        for (&self.ring) |*slot| {
+            if (!slot.in_use) continue;
+            const end = slot.offset_start + slot.length;
+            // Slot must lie entirely within [lo, hi).
+            if (slot.offset_start < lo) continue;
+            if (end > hi) continue;
+            slot.in_use = false;
+            const rtt_us: u64 = if (now_us > slot.send_time_us)
+                now_us - slot.send_time_us
+            else
+                1;
+            self.processSlotAck(slot, rtt_us, now_us);
+        }
     }
 
     pub fn onLoss(
@@ -331,6 +410,35 @@ test "cc loss notification frees bytes_in_transit" {
     cc.onPacketSent(0, 1200, 1000);
     cc.onLoss(0, 1200, 2000);
     try std.testing.expectEqual(@as(u64, 0), cc.ctx.bytes_in_transit);
+}
+
+test "cc ackRange retires all slots in one walk" {
+    var cc: CongestionController = undefined;
+    cc.init(1200, 0);
+    cc.onPacketSent(0, 1200, 1000);
+    cc.onPacketSent(1200, 1200, 1100);
+    cc.onPacketSent(2400, 1200, 1200);
+    cc.onPacketSent(3600, 1200, 1300);
+    try std.testing.expectEqual(@as(u64, 4800), cc.ctx.bytes_in_transit);
+
+    // Ack everything below 3600 in one bulk call.
+    cc.ackRange(0, 3600, 5000);
+    try std.testing.expectEqual(@as(u64, 1200), cc.ctx.bytes_in_transit);
+    try std.testing.expectEqual(@as(u64, 3600), cc.total_delivered_bytes);
+    // The last slot (offset 3600, end 4800 > 3600) is untouched.
+    try std.testing.expectEqual(@as(u64, 1300), cc.sendTimeFor(3600).?);
+}
+
+test "cc ackRange respects hi boundary (partial-overlap slot untouched)" {
+    var cc: CongestionController = undefined;
+    cc.init(1200, 0);
+    cc.onPacketSent(0, 1200, 1000);
+    cc.onPacketSent(1200, 1200, 1100);
+
+    // Ack [0, 1500): slot 0 fits (end=1200), slot 1 does not (end=2400).
+    cc.ackRange(0, 1500, 5000);
+    try std.testing.expectEqual(@as(u64, 1200), cc.ctx.bytes_in_transit);
+    try std.testing.expect(cc.sendTimeFor(1200) != null);
 }
 
 test "cc sendTimeFor finds slot containing offset" {

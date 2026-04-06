@@ -619,20 +619,19 @@ pub const Gateway = struct {
     }
 
     /// Mark every retransmit slot whose stored range lies entirely below
-    /// `cutoff` as free. Also feeds those ranges to the congestion controller
-    /// as cumulative acks. Returns whether any slot below `cutoff` was missing
-    /// (which can happen if a SACK acks a range we never had — should not
-    /// occur in practice).
+    /// `cutoff` as free, and feed those ranges to the congestion controller
+    /// as cumulative acks. Previously this called `cc.onAck` once per slot,
+    /// each doing its own O(cc.ring_slots) linear scan. Now we invoke
+    /// `cc.ackRange(0, cutoff, now_us)` once — the cc ring walks itself
+    /// exactly once — and separately walk the retransmit ring to free
+    /// slots. Total work is O(retransmit_ring_slots + cc.ring_slots) per
+    /// SACK instead of O(retransmit_ring_slots × cc.ring_slots).
     fn ackContiguousBelow(self: *Gateway, cutoff: u64, now_us: u64) void {
+        self.cc.ackRange(0, cutoff, now_us);
         for (self.retransmit_ring) |*slot| {
             if (!slot.in_use) continue;
             const end = slot.offset_start + slot.length;
-            if (end <= cutoff) {
-                const send_time = slot.send_time_us;
-                const rtt_us: u64 = if (now_us > send_time) now_us - send_time else 1;
-                self.cc.onAck(slot.offset_start, slot.length, rtt_us, now_us);
-                slot.in_use = false;
-            }
+            if (end <= cutoff) slot.in_use = false;
         }
     }
 
