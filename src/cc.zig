@@ -1,50 +1,21 @@
-//! Congestion controller shim that wires `c4.State`/`c4.CcContext` and a
+//! Congestion controller shim wiring `c4.State`, `c4.CcContext`, and
 //! `pacer.Pacer` together with minimal transport bookkeeping.
 //!
-//! The transport calls into this module with four events (onPacketSent,
-//! onAck, onLoss, canSend) and a set of ambient measurements. In return it
-//! gets a CWND + pacer that tracks how fast it should be sending.
+//! Sent packets live in a 2048-slot ring keyed by byte-offset range,
+//! holding ~2.2 MiB of in-flight bytes at 1100-byte MTU. Sized to cover
+//! the BDP of any path zmosh realistically runs over — matches the
+//! server-side retransmit ring in serve.zig.
 //!
-//! Sent packets are tracked in a 2048-slot ring keyed by byte-offset range.
-//! That's enough for any realistic BDP on the paths zmosh actually runs
-//! over: at MTU-sized packets (1100 B) the ring holds ~2.2 MiB of
-//! in-flight bytes. Sizing worked from bandwidth × RTT:
+//! `ring_write` is monotonic and each `onPacketSent` records a strictly
+//! higher offset, so insertion order == offset order. `ackRange` walks
+//! the ring once per SACK prefix instead of calling `findSlot` per slot.
 //!
-//!   Gigabit LAN (120 MB/s × 1 ms)    = 120 KB  ≈ 109 packets
-//!   100 Mbps home (12 MB/s × 50 ms)  = 600 KB  ≈ 545 packets
-//!   Coast-to-coast (10 MB/s × 100ms) = 1 MB    ≈ 909 packets
-//!   International (5 MB/s × 150 ms)  = 750 KB  ≈ 682 packets
-//!
-//! At 256 slots (the original sizing) any WAN burst would silently overflow
-//! and evict live slots — C4 would lose feedback for the oldest in-flight
-//! packets, biasing delivery-rate estimation and never seeing RTT samples
-//! for them. 2048 covers everything short of satellite-class links and
-//! matches the server-side retransmit ring sizing in serve.zig.
-//!
-//! The ring is indexed by `(write_counter % ring_slots)`. Because
-//! `ring_write` is monotonic and each `onPacketSent` records an offset
-//! strictly higher than the previous, insertion order == offset order.
-//! Walking the ring in insertion order yields a sorted stream over in-use
-//! slots (modulo wrap). `ackRange` exploits this: one linear pass retires
-//! every slot fully inside an ack range, instead of calling `findSlot`
-//! (O(ring_slots)) once per retired slot.
-//!
-//! Memory: ~50 bytes per SentInfo × 2048 ≈ 100 KB per session. Trivial.
-//!
-//! ### findSlot's exact-match invariant
-//!
-//! `findSlot` uses `slot.offset_start == target` (not range overlap). This
-//! assumes every ack coming back references an offset that some slot
-//! was originally recorded with — i.e. retransmits always reuse the same
-//! `offset_start` and `length` as the original. serve.zig enforces this
-//! by re-sending from the stored retransmit-ring payload verbatim.
-//!
-//! If we ever add "retransmit coalescing" (combining multiple lost
-//! chunks into one bigger retransmit) or "retransmit splitting" (PMTU
-//! drop forces smaller chunks), the invariant breaks and `findSlot` will
-//! silently drop acks. At that point switch to range-overlap matching
-//! using the `length` parameter (which is already plumbed through the
-//! API for this future change). See TODO in `findSlot`.
+//! `findSlot` exact-match invariant: every ack offset must match a slot's
+//! `offset_start` verbatim. serve.zig preserves this by re-sending from
+//! stored retransmit-ring payloads without re-chunking. Retransmit
+//! coalescing or PMTU-driven splitting would break it; the `length`
+//! parameter on `onAck`/`onLoss` is plumbed through for a future switch
+//! to range-overlap matching.
 
 const std = @import("std");
 const c4 = @import("c4.zig");
@@ -166,12 +137,7 @@ pub const CongestionController = struct {
         self.pacer.onSent(length);
     }
 
-    /// Find a slot by exact offset_start. O(ring_slots) linear scan.
-    ///
-    /// Exact-match invariant: callers must pass an `offset_start` that was
-    /// used verbatim in a previous `onPacketSent` call — i.e. retransmits
-    /// must preserve the original offset AND length. See module docstring
-    /// for the implications if this ever needs to change.
+    /// Exact-match lookup by offset_start. See module header for invariant.
     fn findSlot(self: *CongestionController, offset_start: u64) ?*SentInfo {
         for (&self.ring) |*slot| {
             if (!slot.in_use) continue;
@@ -180,9 +146,7 @@ pub const CongestionController = struct {
         return null;
     }
 
-    /// Process the feedback for one acked slot. Updates bytes_in_transit,
-    /// delivery-rate estimates, RTT smoothing, and notifies C4. The caller
-    /// owns finding the slot and marking it not-in-use.
+    /// Feedback for one acked slot. Caller owns slot lookup and freeing.
     fn processSlotAck(self: *CongestionController, slot: *SentInfo, rtt_us: u64, now_us: u64) void {
         const size = slot.length;
         const send_time = slot.send_time_us;
@@ -245,10 +209,7 @@ pub const CongestionController = struct {
         if (rtt_us > 0) c4.notifyRtt(&self.state, &self.ctx, rtt_us, now_us);
     }
 
-    /// Single-offset ack path, used for the gap entries of a SACK (where
-    /// each gap targets a specific chunk). For the contiguous prefix of a
-    /// SACK, prefer `ackRange` — it's a single linear scan over the ring
-    /// rather than one scan per retired slot.
+    /// Single-offset ack. Prefer `ackRange` for contiguous SACK prefixes.
     pub fn onAck(
         self: *CongestionController,
         offset_start: u64,
@@ -262,19 +223,8 @@ pub const CongestionController = struct {
         self.processSlotAck(slot, rtt_us, now_us);
     }
 
-    /// Bulk ack: retire every in-use slot whose byte range lies entirely
-    /// within `[lo, hi)`. Walks the ring once; cost is O(ring_slots),
-    /// independent of how many slots are retired.
-    ///
-    /// This is the picoquic-style "walk adjacent entries after finding the
-    /// range" optimization, adapted to a fixed ring: because insertion
-    /// order matches offset order, every slot in the target range is
-    /// already "adjacent" in the ring and we don't need a findSlot-per-
-    /// retirement loop.
-    ///
-    /// Each retired slot gets its own per-packet RTT derived from
-    /// `now_us - slot.send_time_us`, so RTT fidelity matches the old
-    /// single-ack path.
+    /// Retire every in-use slot whose range is fully within `[lo, hi)`.
+    /// One linear pass; per-slot RTT from `now_us - slot.send_time_us`.
     pub fn ackRange(self: *CongestionController, lo: u64, hi: u64, now_us: u64) void {
         if (hi <= lo) return;
         for (&self.ring) |*slot| {
