@@ -169,14 +169,17 @@ fn sendHeartbeat(
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     now: i64,
+    max_offset: u32,
 ) !void {
+    var hb_buf: [4]u8 = undefined;
+    const hb_payload = transport.buildHeartbeatPayload(max_offset, &hb_buf);
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
         .heartbeat,
         0,
         reliable_recv.ack(),
         reliable_recv.ackBits(),
-        "",
+        hb_payload,
         &pkt_buf,
     );
     try peer.send(sock, pkt);
@@ -340,11 +343,18 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             peer.send(&udp_sock, pkt) catch {};
         }
 
+        // Compute flow-control window: how many more output seqs we can
+        // accept before our stdout buffer fills up. Uses a conservative
+        // 1200-byte per-packet estimate.
+        const available = if (stdout_buf.items.len >= max_stdout_buf) 0 else max_stdout_buf - stdout_buf.items.len;
+        const credit_seqs: u32 = @intCast(@min(@as(usize, std.math.maxInt(u16)), available / 1200));
+        const max_offset: u32 = output_recv.latest +% credit_seqs;
+
         // Ack heartbeat + keepalive heartbeat.
         if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now, max_offset) catch {};
         } else if (peer.shouldSendHeartbeat(now, config)) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now, max_offset) catch {};
         }
 
         // State check

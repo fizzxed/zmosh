@@ -266,6 +266,26 @@ pub fn buildUnreliable(
     return out[0..total];
 }
 
+/// Heartbeat payload: advertises receiver-side flow-control window.
+/// `max_offset` is the highest output-channel sequence number the client is
+/// currently willing to accept. The server must not send output packets
+/// with seq > max_offset; if it does, the client may drop them or the
+/// reorder buffer will overflow.
+pub const HeartbeatPayload = extern struct {
+    max_offset: u32,
+};
+
+pub fn buildHeartbeatPayload(max_offset: u32, out: *[4]u8) []const u8 {
+    std.mem.writeInt(u32, out, max_offset, .big);
+    return out[0..4];
+}
+
+pub fn parseHeartbeatPayload(payload: []const u8) ?HeartbeatPayload {
+    if (payload.len < 4) return null;
+    const max_offset = std.mem.readInt(u32, payload[0..4], .big);
+    return .{ .max_offset = max_offset };
+}
+
 pub fn buildControl(control: Control, out: *[8]u8) []const u8 {
     out[0] = @intFromEnum(control);
     @memset(out[1..], 0);

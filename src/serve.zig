@@ -83,6 +83,11 @@ pub const Gateway = struct {
     /// Oldest unacked output seq, for the naive ack-oldest-on-heartbeat model.
     cc_oldest_unacked: u32,
 
+    /// Last max_offset advertised by the client in a heartbeat. Server must
+    /// not send output packets with seq > client_max_offset.
+    client_max_offset: u32,
+    client_max_offset_known: bool,
+
     pub fn init(
         alloc: std.mem.Allocator,
         session_name: []const u8,
@@ -166,6 +171,8 @@ pub const Gateway = struct {
             .cc = cc,
             .cc_next_wait_us = 0,
             .cc_oldest_unacked = 0,
+            .client_max_offset = 0,
+            .client_max_offset_known = false,
         };
     }
 
@@ -362,6 +369,11 @@ pub const Gateway = struct {
             const pkt_size: u64 = chunk.len + 20;
 
             const now_us = nowUs();
+            // Receiver flow control: stall (not a CC event) if advertised
+            // max_offset would be exceeded.
+            if (self.client_max_offset_known and self.output_seq > self.client_max_offset) {
+                break;
+            }
             if (!self.cc.canSend(pkt_size, now_us)) {
                 self.cc_next_wait_us = self.cc.nextSendTimeUs(pkt_size, now_us);
                 break;
@@ -467,7 +479,12 @@ pub const Gateway = struct {
         }
 
         switch (packet.channel) {
-            .heartbeat => {},
+            .heartbeat => {
+                if (transport.parseHeartbeatPayload(packet.payload)) |hb| {
+                    self.client_max_offset = hb.max_offset;
+                    self.client_max_offset_known = true;
+                }
+            },
             .output => {
                 // Client never sends output channel packets.
             },
