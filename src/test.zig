@@ -8,4 +8,5 @@ comptime {
     _ = @import("c4.zig");
     _ = @import("pacer.zig");
     _ = @import("cc.zig");
+    _ = @import("remote.zig");
 }

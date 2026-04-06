@@ -11,6 +11,131 @@ const max_stdout_buf = 4 * 1024 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
+/// Reorder buffer caps for the output byte stream.
+pub const reorder_max_bytes: usize = 1 * 1024 * 1024;
+pub const reorder_max_fragments: usize = 1024;
+
+const min_stale_us: u64 = 50_000;
+const max_stale_us: u64 = 1_000_000;
+const default_srtt_us: u64 = 200_000;
+
+pub fn staleGapTimeoutUs(srtt_us: u64) u64 {
+    const s: u64 = if (srtt_us == 0) default_srtt_us else srtt_us;
+    return std.math.clamp(3 * s, min_stale_us, max_stale_us);
+}
+
+pub const Fragment = struct {
+    offset_start: u64,
+    arrived_us: u64,
+    bytes: []u8,
+};
+
+pub const ReorderBuffer = struct {
+    alloc: std.mem.Allocator,
+    fragments: std.ArrayList(Fragment),
+    total_bytes: usize = 0,
+
+    pub fn init(alloc: std.mem.Allocator) !ReorderBuffer {
+        return .{
+            .alloc = alloc,
+            .fragments = try std.ArrayList(Fragment).initCapacity(alloc, 16),
+        };
+    }
+
+    pub fn deinit(self: *ReorderBuffer) void {
+        for (self.fragments.items) |f| self.alloc.free(f.bytes);
+        self.fragments.deinit(self.alloc);
+    }
+
+    pub fn clear(self: *ReorderBuffer) void {
+        for (self.fragments.items) |f| self.alloc.free(f.bytes);
+        self.fragments.clearRetainingCapacity();
+        self.total_bytes = 0;
+    }
+
+    pub fn isOverCapacity(self: *const ReorderBuffer) bool {
+        return self.total_bytes > reorder_max_bytes or
+            self.fragments.items.len > reorder_max_fragments;
+    }
+
+    pub fn oldestArrivedUs(self: *const ReorderBuffer) ?u64 {
+        var oldest: ?u64 = null;
+        for (self.fragments.items) |f| {
+            if (oldest == null or f.arrived_us < oldest.?) oldest = f.arrived_us;
+        }
+        return oldest;
+    }
+
+    /// Insert a fragment, keeping the list sorted by offset_start. The
+    /// caller has already trimmed any prefix overlapping `next_deliver_offset`.
+    pub fn insert(self: *ReorderBuffer, offset_start: u64, data: []const u8, arrived_us: u64) !void {
+        if (data.len == 0) return;
+        // Skip duplicates that are already fully covered by an existing
+        // fragment with the same start offset.
+        for (self.fragments.items) |f| {
+            if (f.offset_start == offset_start and f.bytes.len >= data.len) return;
+        }
+        const owned = try self.alloc.dupe(u8, data);
+        var idx: usize = 0;
+        while (idx < self.fragments.items.len and
+            self.fragments.items[idx].offset_start < offset_start) : (idx += 1)
+        {}
+        try self.fragments.insert(self.alloc, idx, .{
+            .offset_start = offset_start,
+            .arrived_us = arrived_us,
+            .bytes = owned,
+        });
+        self.total_bytes += owned.len;
+    }
+
+    /// Pop the fragment whose offset_start equals `at`, returning its bytes
+    /// (caller takes ownership).
+    pub fn popAt(self: *ReorderBuffer, at: u64) ?[]u8 {
+        var i: usize = 0;
+        while (i < self.fragments.items.len) : (i += 1) {
+            const f = self.fragments.items[i];
+            if (f.offset_start == at) {
+                _ = self.fragments.orderedRemove(i);
+                self.total_bytes -= f.bytes.len;
+                return f.bytes;
+            }
+            if (f.offset_start > at) return null;
+        }
+        return null;
+    }
+
+    /// Walk fragments from `next_deliver_offset` upward, computing up to
+    /// `max_sack_gaps` gap ranges between contiguous fragments and the next
+    /// fragment start. Caller passes in the current `highest_contiguous_offset`
+    /// (== next_deliver_offset).
+    pub fn computeGaps(
+        self: *const ReorderBuffer,
+        high: u64,
+        out: *[transport.max_sack_gaps]transport.SackGap,
+    ) u8 {
+        var n: u8 = 0;
+        var cursor: u64 = high;
+        for (self.fragments.items) |f| {
+            if (f.offset_start <= cursor) {
+                const end = f.offset_start + f.bytes.len;
+                if (end > cursor) cursor = end;
+                continue;
+            }
+            // Gap from cursor..f.offset_start
+            const gap_len = f.offset_start - cursor;
+            if (gap_len > std.math.maxInt(u32)) break;
+            out[n] = .{
+                .start_rel = @intCast(cursor - high),
+                .len = @intCast(gap_len),
+            };
+            n += 1;
+            if (n >= transport.max_sack_gaps) break;
+            cursor = f.offset_start + f.bytes.len;
+        }
+        return n;
+    }
+};
+
 const c = switch (builtin.os.tag) {
     .macos => @cImport({
         @cInclude("sys/ioctl.h");
@@ -169,10 +294,10 @@ fn sendHeartbeat(
     last_ack_send_ns: *i64,
     ack_dirty: *bool,
     now: i64,
-    max_offset: u32,
+    max_byte_offset: u64,
 ) !void {
-    var hb_buf: [4]u8 = undefined;
-    const hb_payload = transport.buildHeartbeatPayload(max_offset, &hb_buf);
+    var hb_buf: [8]u8 = undefined;
+    const hb_payload = transport.buildHeartbeatPayload(max_byte_offset, &hb_buf);
     var pkt_buf: [1200]u8 = undefined;
     const pkt = try transport.buildUnreliable(
         .heartbeat,
@@ -277,7 +402,10 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var reliable_send = try transport.ReliableSend.init(alloc);
     defer reliable_send.deinit();
     var reliable_recv = transport.RecvState{};
-    var output_recv = transport.OutputRecvState{};
+
+    var reorder = try ReorderBuffer.init(alloc);
+    defer reorder.deinit();
+    var next_deliver_offset: u64 = 0;
 
     // Set terminal to raw mode
     var orig_termios: c.termios = undefined;
@@ -321,14 +449,8 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var ack_dirty = false;
     var last_resync_request_ns: i64 = 0;
 
-    // Output-channel ack tracking. We maintain `highest_output_seq` and a
-    // bitmask of the 32 prior seqs (bit 0 = highest-1). When we receive an
-    // output packet we update this window; we then schedule an output_ack
-    // either when 20 ms have passed since the last ack OR when 16 new
-    // packets have been received.
-    var highest_output_seq: u32 = 0;
-    var have_highest_output_seq = false;
-    var received_output_seqs: u32 = 0; // bitmask of (highest-1..highest-32)
+    // Output-channel ack tracking. Schedule an output_ack either when 20 ms
+    // have passed since the last ack OR when 16 packets received since.
     var unacked_output_count: u32 = 0;
     var last_output_ack_ns: i64 = @intCast(std.time.nanoTimestamp());
     const output_ack_min_interval_ns: i64 = 20 * std.time.ns_per_ms;
@@ -356,22 +478,38 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             peer.send(&udp_sock, pkt) catch {};
         }
 
-        // Compute flow-control window: how many more output seqs we can
-        // accept before our stdout buffer fills up. Uses a conservative
-        // 1200-byte per-packet estimate.
-        const available = if (stdout_buf.items.len >= max_stdout_buf) 0 else max_stdout_buf - stdout_buf.items.len;
-        const credit_seqs: u32 = @intCast(@min(@as(usize, std.math.maxInt(u16)), available / 1200));
-        const max_offset: u32 = output_recv.latest +% credit_seqs;
+        // Compute flow-control window for output bytes: tell the server how
+        // many more bytes (above next_deliver_offset) we'll accept before our
+        // stdout buffer fills up.
+        const stdout_avail = if (stdout_buf.items.len >= max_stdout_buf) 0 else max_stdout_buf - stdout_buf.items.len;
+        const reorder_avail = if (reorder.total_bytes >= reorder_max_bytes) 0 else reorder_max_bytes - reorder.total_bytes;
+        const credit_bytes: u64 = @intCast(@min(stdout_avail, reorder_avail));
+        const max_byte_offset: u64 = next_deliver_offset + credit_bytes;
 
-        // Output-channel ack: emit when (a) >=20ms elapsed and unacked > 0,
-        // or (b) >=16 packets received since last ack.
-        if (have_highest_output_seq and unacked_output_count > 0) {
+        // Stale-gap detection: if we've been holding the oldest fragment
+        // for longer than the dynamic timeout, escalate to a snapshot resync.
+        if (reorder.oldestArrivedUs()) |oldest| {
+            const srtt_us: u64 = if (peer.srtt_us) |s| @intCast(@max(@as(i64, 0), s)) else 0;
+            const now_us: u64 = @intCast(@divFloor(now, std.time.ns_per_us));
+            if (now_us > oldest and (now_us - oldest) > staleGapTimeoutUs(srtt_us)) {
+                reorder.clear();
+                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+            }
+        }
+
+        // Output-channel SACK: emit when (a) >=20ms elapsed and unacked > 0,
+        // or (b) >=16 packets received since last ack, or (c) we have buffered
+        // gaps to report.
+        const have_gaps = reorder.fragments.items.len > 0;
+        if (unacked_output_count > 0 or have_gaps) {
             const due_by_time = (now - last_output_ack_ns) >= output_ack_min_interval_ns;
             const due_by_count = unacked_output_count >= output_ack_max_unacked;
             if (due_by_time or due_by_count) {
-                var ack_buf: [8]u8 = undefined;
-                const ack_payload = transport.buildOutputAckPayload(highest_output_seq, received_output_seqs, &ack_buf);
-                var pkt_buf: [64]u8 = undefined;
+                var gaps: [transport.max_sack_gaps]transport.SackGap = undefined;
+                const n = reorder.computeGaps(next_deliver_offset, &gaps);
+                var ack_buf: [transport.output_ack_max_encoded_len]u8 = undefined;
+                const ack_payload = transport.buildOutputAckPayload(next_deliver_offset, gaps[0..n], &ack_buf);
+                var pkt_buf: [128]u8 = undefined;
                 const pkt = transport.buildUnreliable(.output_ack, 0, reliable_recv.ack(), reliable_recv.ackBits(), ack_payload, &pkt_buf) catch unreachable;
                 peer.send(&udp_sock, pkt) catch {};
                 last_output_ack_ns = now;
@@ -381,9 +519,9 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 
         // Ack heartbeat + keepalive heartbeat.
         if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now, max_offset) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now, max_byte_offset) catch {};
         } else if (peer.shouldSendHeartbeat(now, config)) {
-            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now, max_offset) catch {};
+            sendHeartbeat(&peer, &udp_sock, &reliable_recv, &last_ack_send_ns, &ack_dirty, now, max_byte_offset) catch {};
         }
 
         // State check
@@ -416,7 +554,7 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
         }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
-        if (have_highest_output_seq and unacked_output_count > 0) {
+        if (unacked_output_count > 0) {
             const next_ack_due_ns = last_output_ack_ns + output_ack_min_interval_ns;
             const remaining_ns = next_ack_due_ns - now;
             const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
@@ -495,43 +633,53 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                         // Server should never send output_ack to client.
                     },
                     .output => {
-                        // Update SACK window for this seq.
-                        if (!have_highest_output_seq) {
-                            highest_output_seq = packet.seq;
-                            have_highest_output_seq = true;
-                            received_output_seqs = 0;
-                        } else if (packet.seq > highest_output_seq) {
-                            const shift_amt = packet.seq - highest_output_seq;
-                            if (shift_amt >= 32) {
-                                received_output_seqs = 0;
-                            } else {
-                                received_output_seqs <<= @intCast(shift_amt);
-                                received_output_seqs |= @as(u32, 1) << @intCast(shift_amt - 1);
-                            }
-                            highest_output_seq = packet.seq;
-                        } else {
-                            const diff = highest_output_seq - packet.seq;
-                            if (diff > 0 and diff <= 32) {
-                                const bit: u32 = @as(u32, 1) << @intCast(diff - 1);
-                                received_output_seqs |= bit;
-                            }
-                        }
                         unacked_output_count +%= 1;
 
-                        switch (output_recv.onPacket(packet.seq)) {
-                            .accept => {
-                                if (packet.payload.len == 0) continue;
-                                if (stdout_buf.items.len + packet.payload.len > max_stdout_buf) {
-                                    stdout_buf.clearRetainingCapacity();
-                                    try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                                } else {
-                                    try stdout_buf.appendSlice(alloc, packet.payload);
-                                }
-                            },
-                            .gap => {
+                        const start_offset = transport.readOutputOffset(packet.payload) orelse continue;
+                        const data_full = packet.payload[transport.output_offset_prefix_len..];
+                        if (data_full.len == 0) continue;
+
+                        // Trim any prefix that's already been delivered (handles
+                        // overlap with retransmits).
+                        var data: []const u8 = data_full;
+                        var offset: u64 = start_offset;
+                        if (offset < next_deliver_offset) {
+                            const skip = next_deliver_offset - offset;
+                            if (skip >= data.len) continue;
+                            data = data[@intCast(skip)..];
+                            offset = next_deliver_offset;
+                        }
+
+                        if (offset == next_deliver_offset) {
+                            // Deliver immediately, then drain any contiguous
+                            // buffered fragments.
+                            if (stdout_buf.items.len + data.len > max_stdout_buf) {
+                                stdout_buf.clearRetainingCapacity();
+                                reorder.clear();
                                 try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
-                            },
-                            .duplicate, .stale => {},
+                            } else {
+                                try stdout_buf.appendSlice(alloc, data);
+                                next_deliver_offset += data.len;
+                                while (reorder.popAt(next_deliver_offset)) |buf_bytes| {
+                                    defer alloc.free(buf_bytes);
+                                    if (stdout_buf.items.len + buf_bytes.len > max_stdout_buf) {
+                                        stdout_buf.clearRetainingCapacity();
+                                        reorder.clear();
+                                        try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                                        break;
+                                    }
+                                    try stdout_buf.appendSlice(alloc, buf_bytes);
+                                    next_deliver_offset += buf_bytes.len;
+                                }
+                            }
+                        } else {
+                            // Out of order — buffer it.
+                            const arrived_us: u64 = @intCast(@divFloor(now, std.time.ns_per_us));
+                            try reorder.insert(offset, data, arrived_us);
+                            if (reorder.isOverCapacity()) {
+                                reorder.clear();
+                                try requestResync(&peer, &udp_sock, &reliable_send, &reliable_recv, &last_resync_request_ns, now);
+                            }
                         }
                     },
                 }
@@ -565,9 +713,84 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
 // Tests
 // ---------------------------------------------------------------------------
 
+test "reorder buffer in-order delivery" {
+    var rb = try ReorderBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+
+    try rb.insert(0, "hello", 100);
+    try std.testing.expectEqual(@as(usize, 1), rb.fragments.items.len);
+    const got = rb.popAt(0).?;
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("hello", got);
+    try std.testing.expectEqual(@as(usize, 0), rb.total_bytes);
+}
+
+test "reorder buffer out-of-order then drain" {
+    var rb = try ReorderBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+
+    // Insert fragments out of order: [10..15], [5..10], [0..5]
+    try rb.insert(10, "fffff", 102);
+    try rb.insert(5, "ddddd", 101);
+    try rb.insert(0, "aaaaa", 100);
+
+    // Walk via popAt — they should drain in offset order.
+    const a = rb.popAt(0).?;
+    defer std.testing.allocator.free(a);
+    try std.testing.expectEqualStrings("aaaaa", a);
+    const b = rb.popAt(5).?;
+    defer std.testing.allocator.free(b);
+    try std.testing.expectEqualStrings("ddddd", b);
+    const c2 = rb.popAt(10).?;
+    defer std.testing.allocator.free(c2);
+    try std.testing.expectEqualStrings("fffff", c2);
+    try std.testing.expectEqual(@as(usize, 0), rb.fragments.items.len);
+}
+
+test "reorder buffer computeGaps" {
+    var rb = try ReorderBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+    // next_deliver_offset = 100. We have fragments at 110, 120, 200.
+    try rb.insert(110, "0123456789", 0); // 110..120
+    try rb.insert(120, "ABCDE", 0); // 120..125 (contiguous with above)
+    try rb.insert(200, "X", 0); // 200..201
+
+    var gaps: [transport.max_sack_gaps]transport.SackGap = undefined;
+    const n = rb.computeGaps(100, &gaps);
+    // Expect: gap [100..110] (rel 0, len 10), then gap [125..200] (rel 25, len 75)
+    try std.testing.expectEqual(@as(u8, 2), n);
+    try std.testing.expectEqual(@as(u32, 0), gaps[0].start_rel);
+    try std.testing.expectEqual(@as(u32, 10), gaps[0].len);
+    try std.testing.expectEqual(@as(u32, 25), gaps[1].start_rel);
+    try std.testing.expectEqual(@as(u32, 75), gaps[1].len);
+}
+
+test "reorder buffer over capacity" {
+    var rb = try ReorderBuffer.init(std.testing.allocator);
+    defer rb.deinit();
+    // Insert > 1024 fragments to trigger capacity check.
+    var i: u64 = 0;
+    while (i < reorder_max_fragments + 1) : (i += 1) {
+        try rb.insert(i * 10, "x", 0);
+    }
+    try std.testing.expect(rb.isOverCapacity());
+    rb.clear();
+    try std.testing.expect(!rb.isOverCapacity());
+    try std.testing.expectEqual(@as(usize, 0), rb.fragments.items.len);
+}
+
+test "staleGapTimeoutUs clamps to bounds" {
+    try std.testing.expectEqual(@as(u64, 50_000), staleGapTimeoutUs(1_000)); // 3*1000 = 3k → clamped low
+    try std.testing.expectEqual(@as(u64, 1_000_000), staleGapTimeoutUs(500_000)); // 1.5M → clamped high
+    try std.testing.expectEqual(@as(u64, 300_000), staleGapTimeoutUs(100_000)); // 300k in range
+    // 0 → use default
+    try std.testing.expectEqual(@as(u64, 600_000), staleGapTimeoutUs(0));
+}
+
 test "parseConnectLine valid" {
-    const result = try parseConnectLine("ZMX_CONNECT udp 60042 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
+    const result = try parseConnectLine("ZMX_CONNECT udp 10.0.0.1 60042 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
     try std.testing.expect(result.port == 60042);
+    try std.testing.expectEqualStrings("10.0.0.1", result.host);
 }
 
 test "parseConnectLine invalid prefix" {

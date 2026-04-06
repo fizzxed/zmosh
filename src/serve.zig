@@ -14,6 +14,18 @@ const max_output_coalesce = 256 * 1024;
 const ack_delay_ns = 20 * std.time.ns_per_ms;
 const resync_cooldown_ns = 250 * std.time.ns_per_ms;
 
+/// Retransmit ring sizing — 2048 slots × max_payload_len ≈ 2.4 MB per session.
+pub const retransmit_ring_slots: usize = 2048;
+
+pub const RetransmitSlot = struct {
+    offset_start: u64 = 0,
+    length: u32 = 0,
+    send_time_us: u64 = 0,
+    last_retransmit_us: u64 = 0,
+    payload: [transport.max_output_data_len]u8 = undefined,
+    in_use: bool = false,
+};
+
 var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 fn handleSigterm(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
@@ -63,7 +75,11 @@ pub const Gateway = struct {
 
     reliable_send: transport.ReliableSend,
     reliable_recv: transport.RecvState,
-    output_seq: u32,
+    /// Monotonic byte offset of the next byte to send on the output channel.
+    next_output_offset: u64,
+    /// FIFO ring of recently-sent output payloads, used for retransmission.
+    retransmit_ring: []RetransmitSlot,
+    retransmit_write: usize,
 
     config: udp.Config,
     running: bool,
@@ -80,13 +96,11 @@ pub const Gateway = struct {
     cc: cc_mod.CongestionController,
     /// Absolute us time at which we should retry a pacer-blocked send.
     cc_next_wait_us: u64,
-    /// Oldest unacked output seq, for the naive ack-oldest-on-heartbeat model.
-    cc_oldest_unacked: u32,
 
-    /// Last max_offset advertised by the client in a heartbeat. Server must
-    /// not send output packets with seq > client_max_offset.
-    client_max_offset: u32,
-    client_max_offset_known: bool,
+    /// Last max_byte_offset advertised by the client in a heartbeat. Server
+    /// must not send output bytes whose end exceeds this value.
+    client_max_byte_offset: u64,
+    client_max_byte_offset_known: bool,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -149,6 +163,9 @@ pub const Gateway = struct {
         var cc: cc_mod.CongestionController = undefined;
         cc.init(@intCast(transport.max_payload_len + 20), nowUs());
 
+        const retransmit_ring = try alloc.alloc(RetransmitSlot, retransmit_ring_slots);
+        for (retransmit_ring) |*slot| slot.* = .{};
+
         return .{
             .alloc = alloc,
             .udp_sock = udp_sock,
@@ -159,7 +176,9 @@ pub const Gateway = struct {
             .output_coalesce_buf = output_coalesce_buf,
             .reliable_send = reliable_send,
             .reliable_recv = .{},
-            .output_seq = 1,
+            .next_output_offset = 0,
+            .retransmit_ring = retransmit_ring,
+            .retransmit_write = 0,
             .config = config,
             .running = true,
             .last_output_flush_ns = now,
@@ -170,9 +189,8 @@ pub const Gateway = struct {
             .last_resize = .{ .rows = 24, .cols = 80 },
             .cc = cc,
             .cc_next_wait_us = 0,
-            .cc_oldest_unacked = 0,
-            .client_max_offset = 0,
-            .client_max_offset_known = false,
+            .client_max_byte_offset = 0,
+            .client_max_byte_offset_known = false,
         };
     }
 
@@ -326,6 +344,8 @@ pub const Gateway = struct {
     }
 
     fn sendHeartbeat(self: *Gateway, now: i64) !void {
+        // The server's heartbeat doesn't need to advertise a flow-control
+        // window — that's the client's job. Send an empty heartbeat.
         var pkt_buf: [1200]u8 = undefined;
         const pkt = try transport.buildUnreliable(
             .heartbeat,
@@ -352,6 +372,49 @@ pub const Gateway = struct {
         }
     }
 
+    /// Send a single output-channel packet carrying `data` starting at
+    /// `offset`. Records the chunk in the retransmit ring (unless the call
+    /// is itself a retransmit, indicated by `record == false`).
+    fn sendOutputChunk(
+        self: *Gateway,
+        offset: u64,
+        data: []const u8,
+        now_us: u64,
+        record: bool,
+    ) !void {
+        std.debug.assert(data.len <= transport.max_output_data_len);
+
+        var pkt_buf: [1200]u8 = undefined;
+        var payload_buf: [transport.max_payload_len]u8 = undefined;
+        transport.writeOutputOffset(payload_buf[0..transport.output_offset_prefix_len], offset);
+        @memcpy(payload_buf[transport.output_offset_prefix_len..][0..data.len], data);
+        const payload = payload_buf[0 .. transport.output_offset_prefix_len + data.len];
+
+        const pkt = try transport.buildUnreliable(
+            .output,
+            0,
+            self.reliable_recv.ack(),
+            self.reliable_recv.ackBits(),
+            payload,
+            &pkt_buf,
+        );
+        try self.peer.send(&self.udp_sock, pkt);
+
+        self.cc.onPacketSent(offset, @intCast(data.len), now_us);
+
+        if (record) {
+            const idx = self.retransmit_write % retransmit_ring_slots;
+            self.retransmit_write += 1;
+            const slot = &self.retransmit_ring[idx];
+            slot.offset_start = offset;
+            slot.length = @intCast(data.len);
+            slot.send_time_us = now_us;
+            slot.last_retransmit_us = 0;
+            @memcpy(slot.payload[0..data.len], data);
+            slot.in_use = true;
+        }
+    }
+
     fn flushOutput(self: *Gateway, now: i64, force: bool) !void {
         if (self.output_coalesce_buf.items.len == 0) return;
         if (!force and (now - self.last_output_flush_ns) < self.outputFlushIntervalNs()) return;
@@ -364,14 +427,16 @@ pub const Gateway = struct {
 
         var sent_off: usize = 0;
         while (sent_off < self.output_coalesce_buf.items.len) {
-            const end = @min(sent_off + transport.max_payload_len, self.output_coalesce_buf.items.len);
+            const end = @min(sent_off + transport.max_output_data_len, self.output_coalesce_buf.items.len);
             const chunk = self.output_coalesce_buf.items[sent_off..end];
-            const pkt_size: u64 = chunk.len + 20;
+            const pkt_size: u64 = chunk.len + transport.output_offset_prefix_len + 20;
 
             const now_us = nowUs();
-            // Receiver flow control: stall (not a CC event) if advertised
-            // max_offset would be exceeded.
-            if (self.client_max_offset_known and self.output_seq > self.client_max_offset) {
+            // Receiver flow control: stall if the chunk would exceed the
+            // client's advertised byte-offset window.
+            if (self.client_max_byte_offset_known and
+                self.next_output_offset + chunk.len > self.client_max_byte_offset)
+            {
                 break;
             }
             if (!self.cc.canSend(pkt_size, now_us)) {
@@ -379,19 +444,8 @@ pub const Gateway = struct {
                 break;
             }
 
-            var pkt_buf: [1200]u8 = undefined;
-            const seq = self.output_seq;
-            self.output_seq +%= 1;
-            const pkt = try transport.buildUnreliable(
-                .output,
-                seq,
-                self.reliable_recv.ack(),
-                self.reliable_recv.ackBits(),
-                chunk,
-                &pkt_buf,
-            );
-
-            self.peer.send(&self.udp_sock, pkt) catch |err| {
+            const offset = self.next_output_offset;
+            self.sendOutputChunk(offset, chunk, now_us, true) catch |err| {
                 if (err == error.WouldBlock) {
                     log.debug("udp output send would block; dropping stale output and requesting resync", .{});
                     self.output_coalesce_buf.clearRetainingCapacity();
@@ -406,10 +460,7 @@ pub const Gateway = struct {
                 }
                 return err;
             };
-
-            self.cc.onPacketSent(seq, @intCast(pkt_size), now_us);
-            if (self.cc_oldest_unacked == 0) self.cc_oldest_unacked = seq;
-
+            self.next_output_offset += chunk.len;
             sent_off = end;
         }
 
@@ -468,14 +519,14 @@ pub const Gateway = struct {
         switch (packet.channel) {
             .output_ack => {
                 if (transport.parseOutputAckPayload(packet.payload)) |oa| {
-                    self.applyOutputAck(oa.ack_seq, oa.ack_bits, now_us);
+                    self.applyOutputAck(oa, now_us, now);
                 }
                 return;
             },
             .heartbeat => {
                 if (transport.parseHeartbeatPayload(packet.payload)) |hb| {
-                    self.client_max_offset = hb.max_offset;
-                    self.client_max_offset_known = true;
+                    self.client_max_byte_offset = hb.max_byte_offset;
+                    self.client_max_byte_offset_known = true;
                 }
             },
             .output => {
@@ -557,51 +608,65 @@ pub const Gateway = struct {
         try self.sendIpcReliable(tag, payload, now);
     }
 
-    /// Process a decoded output_ack from the client. Walks the SACK window
-    /// from `cc_oldest_unacked` up to `ack_seq`, calling `cc.onAck` for
-    /// every seq the bitmask reports as received and `cc.onLoss` for every
-    /// seq inside the bitmask window that is reported missing.
-    fn applyOutputAck(self: *Gateway, ack_seq: u32, ack_bits: u32, now_us: u64) void {
-        if (ack_seq == 0) return;
+    /// Look up a retransmit slot whose stored range overlaps the requested
+    /// byte range. Returns null if the range has been evicted.
+    fn findRetransmitSlot(self: *Gateway, offset_start: u64) ?*RetransmitSlot {
+        for (self.retransmit_ring) |*slot| {
+            if (!slot.in_use) continue;
+            if (slot.offset_start == offset_start) return slot;
+        }
+        return null;
+    }
 
-        var seq = self.cc_oldest_unacked;
-        if (seq == 0) seq = 1;
-        // Bound the walk to avoid stepping over the entire seq space if the
-        // server has just started.
-        if (ack_seq + 1 < seq) return;
-        if (ack_seq - seq > 1024) seq = ack_seq - 1024;
-
-        var s = seq;
-        while (s <= ack_seq) : (s += 1) {
-            const is_top = (s == ack_seq);
-            var was_received = is_top;
-            if (!is_top) {
-                const diff = ack_seq - s;
-                if (diff >= 1 and diff <= 32) {
-                    const bit: u32 = @as(u32, 1) << @intCast(diff - 1);
-                    was_received = (ack_bits & bit) != 0;
-                } else {
-                    // Outside the bitmask window — we have no information,
-                    // so don't synthesize loss. Treat as 'unknown'.
-                    continue;
-                }
-            }
-
-            if (was_received) {
-                const send_time = self.cc.sendTimeFor(s) orelse {
-                    continue;
-                };
+    /// Mark every retransmit slot whose stored range lies entirely below
+    /// `cutoff` as free. Also feeds those ranges to the congestion controller
+    /// as cumulative acks. Returns whether any slot below `cutoff` was missing
+    /// (which can happen if a SACK acks a range we never had — should not
+    /// occur in practice).
+    fn ackContiguousBelow(self: *Gateway, cutoff: u64, now_us: u64) void {
+        for (self.retransmit_ring) |*slot| {
+            if (!slot.in_use) continue;
+            const end = slot.offset_start + slot.length;
+            if (end <= cutoff) {
+                const send_time = slot.send_time_us;
                 const rtt_us: u64 = if (now_us > send_time) now_us - send_time else 1;
-                self.cc.onAck(s, rtt_us, now_us);
-            } else {
-                // Within the bitmask window and missing -> declared lost.
-                self.cc.onLoss(s, now_us);
+                self.cc.onAck(slot.offset_start, slot.length, rtt_us, now_us);
+                slot.in_use = false;
             }
         }
+    }
 
-        // Advance oldest_unacked past the contiguous acked prefix above.
-        if (ack_seq + 1 > self.cc_oldest_unacked) {
-            self.cc_oldest_unacked = ack_seq + 1;
+    /// Apply a decoded SACK from the client. Acks contiguous bytes below
+    /// `highest_contiguous_offset`, then for each gap notifies CC of loss
+    /// and either retransmits the bytes (if still in the ring) or escalates
+    /// to a full snapshot resync (if evicted).
+    fn applyOutputAck(self: *Gateway, sack: transport.OutputAckPayload, now_us: u64, now_ns: i64) void {
+        self.ackContiguousBelow(sack.highest_contiguous_offset, now_us);
+
+        var i: usize = 0;
+        while (i < sack.n_gaps) : (i += 1) {
+            const gap = sack.gaps[i];
+            if (gap.len == 0) continue;
+            const gap_start = sack.highest_contiguous_offset + gap.start_rel;
+            // Search the ring for the slot exactly matching this gap. (Server
+            // chunking is deterministic so the gap should align to a slot.)
+            const slot = self.findRetransmitSlot(gap_start);
+            if (slot) |s| {
+                self.cc.onLoss(s.offset_start, s.length, now_us);
+                const cooldown_us: u64 = blk: {
+                    const srtt = self.peer.srtt_us orelse @as(i64, 100_000);
+                    const c: u64 = @intCast(@max(srtt, @as(i64, 20_000)));
+                    break :blk c;
+                };
+                if (now_us - s.last_retransmit_us >= cooldown_us) {
+                    s.last_retransmit_us = now_us;
+                    self.sendOutputChunk(s.offset_start, s.payload[0..s.length], now_us, false) catch {};
+                }
+            } else {
+                // Range has been evicted from the ring — escalate.
+                self.cc.onLoss(gap_start, gap.len, now_us);
+                self.requestSnapshot(now_ns) catch {};
+            }
         }
     }
 
@@ -612,6 +677,7 @@ pub const Gateway = struct {
         self.unix_write_buf.deinit(self.alloc);
         self.output_coalesce_buf.deinit(self.alloc);
         self.reliable_send.deinit();
+        self.alloc.free(self.retransmit_ring);
     }
 };
 

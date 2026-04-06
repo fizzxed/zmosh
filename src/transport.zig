@@ -1,9 +1,27 @@
 const std = @import("std");
 const ipc = @import("ipc.zig");
 
-pub const version: u8 = 1;
+pub const version: u8 = 2;
 pub const max_payload_len: usize = 1100;
 const header_len: usize = 20;
+
+/// On the output channel, payloads are prefixed with an 8-byte big-endian
+/// `start_offset: u64`. The remaining bytes are the actual stream data
+/// starting at that byte offset. The output channel is now a reliable,
+/// ordered byte stream — the server retransmits gaps in response to SACKs
+/// from the client and the client reorders before delivering to stdout.
+pub const output_offset_prefix_len: usize = 8;
+pub const max_output_data_len: usize = max_payload_len - output_offset_prefix_len;
+
+pub fn writeOutputOffset(buf: []u8, offset: u64) void {
+    std.debug.assert(buf.len >= output_offset_prefix_len);
+    std.mem.writeInt(u64, buf[0..8], offset, .big);
+}
+
+pub fn readOutputOffset(payload: []const u8) ?u64 {
+    if (payload.len < output_offset_prefix_len) return null;
+    return std.mem.readInt(u64, payload[0..8], .big);
+}
 
 pub const Channel = enum(u8) {
     heartbeat = 0,
@@ -13,30 +31,63 @@ pub const Channel = enum(u8) {
     output_ack = 4,
 };
 
-/// Payload of an output_ack packet. Carries a SACK-style window over the
-/// most recent 33 output sequence numbers received by the client.
+/// Payload of an output_ack packet. SACK over the byte-offset output stream.
 ///
-/// `ack_seq` is the highest output seq the client has received. `ack_bits`
-/// bit `i` (i in 0..31) is set when seq `(ack_seq - 1 - i)` was also
-/// received. RTT is derived server-side from the sent-packet ring slot, so
-/// no per-ack timestamp is carried on the wire.
-pub const OutputAckPayload = extern struct {
-    ack_seq: u32,
-    ack_bits: u32,
+/// `highest_contiguous_offset` — all bytes strictly below this are received
+/// in order. `gaps` — up to 8 missing ranges above the high-water mark, with
+/// `start` expressed as a byte offset RELATIVE to `highest_contiguous_offset`
+/// (so it fits in u32 even on long-running sessions).
+pub const max_sack_gaps: usize = 8;
+
+pub const SackGap = struct {
+    start_rel: u32,
+    len: u32,
 };
 
-pub fn buildOutputAckPayload(ack_seq: u32, ack_bits: u32, out: *[8]u8) []const u8 {
-    std.mem.writeInt(u32, out[0..4], ack_seq, .big);
-    std.mem.writeInt(u32, out[4..8], ack_bits, .big);
-    return out[0..8];
+pub const OutputAckPayload = struct {
+    highest_contiguous_offset: u64,
+    gaps: [max_sack_gaps]SackGap = [_]SackGap{.{ .start_rel = 0, .len = 0 }} ** max_sack_gaps,
+    n_gaps: u8 = 0,
+};
+
+/// Maximum encoded length of an output_ack payload (8 + 1 + 8*8 = 73).
+pub const output_ack_max_encoded_len: usize = 9 + max_sack_gaps * 8;
+
+pub fn buildOutputAckPayload(
+    highest_contiguous_offset: u64,
+    gaps: []const SackGap,
+    out: []u8,
+) []const u8 {
+    std.debug.assert(gaps.len <= max_sack_gaps);
+    const total = 9 + gaps.len * 8;
+    std.debug.assert(out.len >= total);
+    std.mem.writeInt(u64, out[0..8], highest_contiguous_offset, .big);
+    out[8] = @intCast(gaps.len);
+    var i: usize = 0;
+    while (i < gaps.len) : (i += 1) {
+        const base = 9 + i * 8;
+        std.mem.writeInt(u32, out[base..][0..4], gaps[i].start_rel, .big);
+        std.mem.writeInt(u32, out[base + 4 ..][0..4], gaps[i].len, .big);
+    }
+    return out[0..total];
 }
 
 pub fn parseOutputAckPayload(payload: []const u8) ?OutputAckPayload {
-    if (payload.len < 8) return null;
-    return .{
-        .ack_seq = std.mem.readInt(u32, payload[0..4], .big),
-        .ack_bits = std.mem.readInt(u32, payload[4..8], .big),
-    };
+    if (payload.len < 9) return null;
+    const high = std.mem.readInt(u64, payload[0..8], .big);
+    const n: usize = payload[8];
+    if (n > max_sack_gaps) return null;
+    if (payload.len < 9 + n * 8) return null;
+    var out: OutputAckPayload = .{ .highest_contiguous_offset = high, .n_gaps = @intCast(n) };
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const base = 9 + i * 8;
+        out.gaps[i] = .{
+            .start_rel = std.mem.readInt(u32, payload[base..][0..4], .big),
+            .len = std.mem.readInt(u32, payload[base + 4 ..][0..4], .big),
+        };
+    }
+    return out;
 }
 
 pub const Control = enum(u8) {
@@ -55,13 +106,6 @@ pub const ReliableAction = enum {
     accept,
     duplicate,
     stale,
-};
-
-pub const OutputAction = enum {
-    accept,
-    duplicate,
-    stale,
-    gap,
 };
 
 pub const RecvState = struct {
@@ -105,35 +149,6 @@ pub const RecvState = struct {
 
     pub fn ackBits(self: *const RecvState) u32 {
         return if (self.has_latest) self.mask else 0;
-    }
-};
-
-pub const OutputRecvState = struct {
-    latest: u32 = 0,
-    has_latest: bool = false,
-
-    pub fn onPacket(self: *OutputRecvState, seq: u32) OutputAction {
-        if (!self.has_latest) {
-            self.latest = seq;
-            self.has_latest = true;
-            return .accept;
-        }
-
-        // Compare seqs modulo 2^32 using signed difference (RFC 793 style).
-        // Wrapping subtract, then reinterpret as i32: positive values mean
-        // `seq` is "ahead" of `latest` in the wrapping sense, negative means
-        // "behind". This lets output_seq wrap through 0 without breaking
-        // gap/duplicate detection.
-        const diff: i32 = @bitCast(seq -% self.latest);
-        if (diff == 0) return .duplicate;
-        if (diff < 0) return .duplicate; // old packet, possibly reordered
-        if (diff == 1) {
-            self.latest = seq;
-            return .accept;
-        }
-        // seq jumped ahead by more than one
-        self.latest = seq;
-        return .gap;
     }
 };
 
@@ -296,24 +311,23 @@ pub fn buildUnreliable(
     return out[0..total];
 }
 
-/// Heartbeat payload: advertises receiver-side flow-control window.
-/// `max_offset` is the highest output-channel sequence number the client is
-/// currently willing to accept. The server must not send output packets
-/// with seq > max_offset; if it does, the client may drop them or the
-/// reorder buffer will overflow.
+/// Heartbeat payload: advertises receiver-side flow-control window for the
+/// output byte stream. `max_byte_offset` is the highest output-channel byte
+/// offset the client is willing to accept. The server must not send output
+/// packets whose `start_offset + payload_len` exceeds `max_byte_offset`.
 pub const HeartbeatPayload = extern struct {
-    max_offset: u32,
+    max_byte_offset: u64,
 };
 
-pub fn buildHeartbeatPayload(max_offset: u32, out: *[4]u8) []const u8 {
-    std.mem.writeInt(u32, out, max_offset, .big);
-    return out[0..4];
+pub fn buildHeartbeatPayload(max_byte_offset: u64, out: *[8]u8) []const u8 {
+    std.mem.writeInt(u64, out, max_byte_offset, .big);
+    return out[0..8];
 }
 
 pub fn parseHeartbeatPayload(payload: []const u8) ?HeartbeatPayload {
-    if (payload.len < 4) return null;
-    const max_offset = std.mem.readInt(u32, payload[0..4], .big);
-    return .{ .max_offset = max_offset };
+    if (payload.len < 8) return null;
+    const max_byte_offset = std.mem.readInt(u64, payload[0..8], .big);
+    return .{ .max_byte_offset = max_byte_offset };
 }
 
 pub fn buildControl(control: Control, out: *[8]u8) []const u8 {
@@ -360,52 +374,47 @@ test "reliable recv window" {
     try std.testing.expectEqual(@as(u32, 11), recv.ack());
 }
 
-test "output_ack payload round trip" {
-    var buf: [8]u8 = undefined;
-    const payload = buildOutputAckPayload(1234, 0xDEADBEEF, &buf);
-    const parsed = parseOutputAckPayload(payload).?;
-    try std.testing.expectEqual(@as(u32, 1234), parsed.ack_seq);
-    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), parsed.ack_bits);
+test "output_ack SACK round trip" {
+    var buf: [output_ack_max_encoded_len]u8 = undefined;
 
-    // ack_bits with gaps (e.g. seqs 100, 98, 95 received -> ack_seq=100,
-    // bit 1 (=98) and bit 4 (=95) set in ack_bits).
-    var buf2: [8]u8 = undefined;
-    const gap_bits: u32 = (@as(u32, 1) << 1) | (@as(u32, 1) << 4);
-    const p2 = buildOutputAckPayload(100, gap_bits, &buf2);
+    // No-gap case.
+    const empty: []const SackGap = &.{};
+    const p_empty = buildOutputAckPayload(123_456, empty, &buf);
+    const parsed_empty = parseOutputAckPayload(p_empty).?;
+    try std.testing.expectEqual(@as(u64, 123_456), parsed_empty.highest_contiguous_offset);
+    try std.testing.expectEqual(@as(u8, 0), parsed_empty.n_gaps);
+
+    // Gappy case: 3 gaps of varying sizes.
+    var buf2: [output_ack_max_encoded_len]u8 = undefined;
+    const gaps = [_]SackGap{
+        .{ .start_rel = 100, .len = 50 },
+        .{ .start_rel = 200, .len = 75 },
+        .{ .start_rel = 1000, .len = 1 },
+    };
+    const p2 = buildOutputAckPayload(0xDEAD_BEEF_CAFE_0000, gaps[0..], &buf2);
     const parsed2 = parseOutputAckPayload(p2).?;
-    try std.testing.expectEqual(gap_bits, parsed2.ack_bits);
+    try std.testing.expectEqual(@as(u64, 0xDEAD_BEEF_CAFE_0000), parsed2.highest_contiguous_offset);
+    try std.testing.expectEqual(@as(u8, 3), parsed2.n_gaps);
+    try std.testing.expectEqual(@as(u32, 100), parsed2.gaps[0].start_rel);
+    try std.testing.expectEqual(@as(u32, 50), parsed2.gaps[0].len);
+    try std.testing.expectEqual(@as(u32, 200), parsed2.gaps[1].start_rel);
+    try std.testing.expectEqual(@as(u32, 75), parsed2.gaps[1].len);
+    try std.testing.expectEqual(@as(u32, 1000), parsed2.gaps[2].start_rel);
+    try std.testing.expectEqual(@as(u32, 1), parsed2.gaps[2].len);
+
+    // Truncated payload should fail.
+    try std.testing.expect(parseOutputAckPayload(p2[0 .. p2.len - 1]) == null);
 }
 
-test "output gap detection" {
-    var out = OutputRecvState{};
-    try std.testing.expect(out.onPacket(1) == .accept);
-    try std.testing.expect(out.onPacket(3) == .gap);
-    try std.testing.expect(out.onPacket(2) == .duplicate);
+test "heartbeat byte-offset round trip" {
+    var buf: [8]u8 = undefined;
+    const payload = buildHeartbeatPayload(0x1122_3344_5566_7788, &buf);
+    const parsed = parseHeartbeatPayload(payload).?;
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), parsed.max_byte_offset);
 }
 
-test "output recv wraps through u32 boundary" {
-    var out = OutputRecvState{};
-    // Push latest near the top of the seq space.
-    out.latest = 0xFFFF_FFFE;
-    out.has_latest = true;
-
-    // latest+1 = 0xFFFF_FFFF → accept
-    try std.testing.expect(out.onPacket(0xFFFF_FFFF) == .accept);
-    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), out.latest);
-
-    // latest+1 = 0 (wrap) → accept
-    try std.testing.expect(out.onPacket(0) == .accept);
-    try std.testing.expectEqual(@as(u32, 0), out.latest);
-
-    // latest+1 = 1 → accept
-    try std.testing.expect(out.onPacket(1) == .accept);
-
-    // Jump ahead past wrap → gap
-    try std.testing.expect(out.onPacket(5) == .gap);
-    try std.testing.expectEqual(@as(u32, 5), out.latest);
-
-    // An old packet from before the wrap must still be .duplicate,
-    // not accepted as "ahead" just because its raw u32 value is larger.
-    try std.testing.expect(out.onPacket(0xFFFF_FF00) == .duplicate);
-    try std.testing.expectEqual(@as(u32, 5), out.latest);
+test "output offset prefix round trip" {
+    var buf: [output_offset_prefix_len]u8 = undefined;
+    writeOutputOffset(&buf, 0xCAFEBABE_DEADBEEF);
+    try std.testing.expectEqual(@as(u64, 0xCAFEBABE_DEADBEEF), readOutputOffset(&buf).?);
 }
