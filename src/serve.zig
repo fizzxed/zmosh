@@ -463,22 +463,15 @@ pub const Gateway = struct {
 
         self.reliable_send.ack(packet.ack, packet.ack_bits);
 
-        // TODO: the output channel is currently unreliable and has no ACKs.
-        // As a minimal CC feeding strategy, treat each received packet as
-        // implicit progress: ack the oldest outstanding output seq (if any)
-        // using the peer's current smoothed RTT. This gives C4 an RTT stream
-        // and lets bytes_in_transit drain, though it does not detect loss.
-        // Proper integration would extend the client heartbeat to carry an
-        // output-channel ack_seq/ack_bits just like the reliable channel.
         const now_us = nowUs();
-        const rtt_us: u64 = if (self.peer.srtt_us) |s| @intCast(@max(@as(i64, 1000), s)) else 0;
-        if (self.cc_oldest_unacked != 0) {
-            const acked = self.cc_oldest_unacked;
-            self.cc_oldest_unacked = if (acked + 1 < self.output_seq) acked + 1 else 0;
-            self.cc.onAck(acked, rtt_us, now_us);
-        }
 
         switch (packet.channel) {
+            .output_ack => {
+                if (transport.parseOutputAckPayload(packet.payload)) |oa| {
+                    self.applyOutputAck(oa.ack_seq, oa.ack_bits, now_us);
+                }
+                return;
+            },
             .heartbeat => {
                 if (transport.parseHeartbeatPayload(packet.payload)) |hb| {
                     self.client_max_offset = hb.max_offset;
@@ -562,6 +555,54 @@ pub const Gateway = struct {
 
         try self.flushOutput(now, true);
         try self.sendIpcReliable(tag, payload, now);
+    }
+
+    /// Process a decoded output_ack from the client. Walks the SACK window
+    /// from `cc_oldest_unacked` up to `ack_seq`, calling `cc.onAck` for
+    /// every seq the bitmask reports as received and `cc.onLoss` for every
+    /// seq inside the bitmask window that is reported missing.
+    fn applyOutputAck(self: *Gateway, ack_seq: u32, ack_bits: u32, now_us: u64) void {
+        if (ack_seq == 0) return;
+
+        var seq = self.cc_oldest_unacked;
+        if (seq == 0) seq = 1;
+        // Bound the walk to avoid stepping over the entire seq space if the
+        // server has just started.
+        if (ack_seq + 1 < seq) return;
+        if (ack_seq - seq > 1024) seq = ack_seq - 1024;
+
+        var s = seq;
+        while (s <= ack_seq) : (s += 1) {
+            const is_top = (s == ack_seq);
+            var was_received = is_top;
+            if (!is_top) {
+                const diff = ack_seq - s;
+                if (diff >= 1 and diff <= 32) {
+                    const bit: u32 = @as(u32, 1) << @intCast(diff - 1);
+                    was_received = (ack_bits & bit) != 0;
+                } else {
+                    // Outside the bitmask window — we have no information,
+                    // so don't synthesize loss. Treat as 'unknown'.
+                    continue;
+                }
+            }
+
+            if (was_received) {
+                const send_time = self.cc.sendTimeFor(s) orelse {
+                    continue;
+                };
+                const rtt_us: u64 = if (now_us > send_time) now_us - send_time else 1;
+                self.cc.onAck(s, rtt_us, now_us);
+            } else {
+                // Within the bitmask window and missing -> declared lost.
+                self.cc.onLoss(s, now_us);
+            }
+        }
+
+        // Advance oldest_unacked past the contiguous acked prefix above.
+        if (ack_seq + 1 > self.cc_oldest_unacked) {
+            self.cc_oldest_unacked = ack_seq + 1;
+        }
     }
 
     pub fn deinit(self: *Gateway) void {

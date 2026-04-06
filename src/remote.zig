@@ -321,6 +321,19 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
     var ack_dirty = false;
     var last_resync_request_ns: i64 = 0;
 
+    // Output-channel ack tracking. We maintain `highest_output_seq` and a
+    // bitmask of the 32 prior seqs (bit 0 = highest-1). When we receive an
+    // output packet we update this window; we then schedule an output_ack
+    // either when 20 ms have passed since the last ack OR when 16 new
+    // packets have been received.
+    var highest_output_seq: u32 = 0;
+    var have_highest_output_seq = false;
+    var received_output_seqs: u32 = 0; // bitmask of (highest-1..highest-32)
+    var unacked_output_count: u32 = 0;
+    var last_output_ack_ns: i64 = @intCast(std.time.nanoTimestamp());
+    const output_ack_min_interval_ns: i64 = 20 * std.time.ns_per_ms;
+    const output_ack_max_unacked: u32 = 16;
+
     // Send Init message with terminal size (reliable)
     const size = getTerminalSize();
     var init_buf: [64]u8 = undefined;
@@ -349,6 +362,23 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
         const available = if (stdout_buf.items.len >= max_stdout_buf) 0 else max_stdout_buf - stdout_buf.items.len;
         const credit_seqs: u32 = @intCast(@min(@as(usize, std.math.maxInt(u16)), available / 1200));
         const max_offset: u32 = output_recv.latest +% credit_seqs;
+
+        // Output-channel ack: emit when (a) >=20ms elapsed and unacked > 0,
+        // or (b) >=16 packets received since last ack.
+        if (have_highest_output_seq and unacked_output_count > 0) {
+            const due_by_time = (now - last_output_ack_ns) >= output_ack_min_interval_ns;
+            const due_by_count = unacked_output_count >= output_ack_max_unacked;
+            if (due_by_time or due_by_count) {
+                var ack_buf: [12]u8 = undefined;
+                const peer_time_us: u32 = @truncate(@as(u64, @intCast(@divFloor(now, std.time.ns_per_us))));
+                const ack_payload = transport.buildOutputAckPayload(highest_output_seq, received_output_seqs, peer_time_us, &ack_buf);
+                var pkt_buf: [64]u8 = undefined;
+                const pkt = transport.buildUnreliable(.output_ack, 0, reliable_recv.ack(), reliable_recv.ackBits(), ack_payload, &pkt_buf) catch unreachable;
+                peer.send(&udp_sock, pkt) catch {};
+                last_output_ack_ns = now;
+                unacked_output_count = 0;
+            }
+        }
 
         // Ack heartbeat + keepalive heartbeat.
         if (ack_dirty and (now - last_ack_send_ns) >= ack_delay_ns) {
@@ -387,6 +417,12 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
             poll_timeout = @min(poll_timeout, @max(@as(i64, 1), rto_ms));
         }
         if (ack_dirty) poll_timeout = @min(poll_timeout, @as(i64, 20));
+        if (have_highest_output_seq and unacked_output_count > 0) {
+            const next_ack_due_ns = last_output_ack_ns + output_ack_min_interval_ns;
+            const remaining_ns = next_ack_due_ns - now;
+            const remaining_ms = if (remaining_ns <= 0) 0 else @divFloor(remaining_ns, std.time.ns_per_ms);
+            poll_timeout = @min(poll_timeout, remaining_ms);
+        }
 
         _ = posix.poll(poll_fds[0..poll_count], @intCast(poll_timeout)) catch |err| {
             if (err == error.Interrupted) continue;
@@ -456,7 +492,33 @@ pub fn remoteAttach(alloc: std.mem.Allocator, session: RemoteSession) !void {
                             offset += msg_len;
                         }
                     },
+                    .output_ack => {
+                        // Server should never send output_ack to client.
+                    },
                     .output => {
+                        // Update SACK window for this seq.
+                        if (!have_highest_output_seq) {
+                            highest_output_seq = packet.seq;
+                            have_highest_output_seq = true;
+                            received_output_seqs = 0;
+                        } else if (packet.seq > highest_output_seq) {
+                            const shift_amt = packet.seq - highest_output_seq;
+                            if (shift_amt >= 32) {
+                                received_output_seqs = 0;
+                            } else {
+                                received_output_seqs <<= @intCast(shift_amt);
+                                received_output_seqs |= @as(u32, 1) << @intCast(shift_amt - 1);
+                            }
+                            highest_output_seq = packet.seq;
+                        } else {
+                            const diff = highest_output_seq - packet.seq;
+                            if (diff > 0 and diff <= 32) {
+                                const bit: u32 = @as(u32, 1) << @intCast(diff - 1);
+                                received_output_seqs |= bit;
+                            }
+                        }
+                        unacked_output_count +%= 1;
+
                         switch (output_recv.onPacket(packet.seq)) {
                             .accept => {
                                 if (packet.payload.len == 0) continue;
