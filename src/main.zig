@@ -9,6 +9,8 @@ const completions = @import("completions.zig");
 const util = @import("util.zig");
 const cross = @import("cross.zig");
 const socket = @import("socket.zig");
+const remote = @import("remote.zig");
+const serve_mod = @import("serve.zig");
 
 pub const version = build_options.version;
 pub const git_sha = build_options.git_sha;
@@ -92,12 +94,33 @@ pub fn main() !void {
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
-        const session_name = args.next() orelse "";
+        var session_name: []const u8 = "";
+        var remote_host: ?[]const u8 = null;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
         while (args.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--remote") or std.mem.eql(u8, arg, "-r")) {
+                remote_host = args.next();
+                continue;
+            }
+            if (session_name.len == 0) {
+                session_name = arg;
+                continue;
+            }
             try command_args.append(alloc, arg);
+        }
+
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        if (remote_host) |host| {
+            const session = remote.connectRemote(alloc, host, sesh) catch |err| {
+                std.log.err("remote connect failed: {s}", .{@errorName(err)});
+                return;
+            };
+            defer alloc.free(session.host);
+            return remote.remoteAttach(alloc, session);
         }
 
         const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
@@ -108,9 +131,6 @@ pub fn main() !void {
 
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd = std.posix.getcwd(&cwd_buf) catch "";
-
-        const sesh = try socket.getSeshName(alloc, session_name);
-        defer alloc.free(sesh);
         var daemon = Daemon{
             .running = true,
             .cfg = &cfg,
@@ -130,6 +150,36 @@ pub fn main() !void {
         };
         std.log.info("socket path={s}", .{daemon.socket_path});
         return attach(&daemon);
+    } else if (std.mem.eql(u8, cmd, "serve") or std.mem.eql(u8, cmd, "s")) {
+        const session_name = args.next() orelse "";
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+
+        // Ensure the session daemon exists (create if needed), same as attach.
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+        var daemon = Daemon{
+            .running = true,
+            .cfg = &cfg,
+            .alloc = alloc,
+            .clients = clients,
+            .session_name = sesh,
+            .socket_path = undefined,
+            .pid = undefined,
+            .command = null,
+            .cwd = cwd,
+            .created_at = @intCast(std.time.timestamp()),
+            .leader_client_fd = null,
+        };
+        daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        const result = try daemon.ensureSession();
+        if (result.is_daemon) return; // we are the forked daemon child
+
+        return serve_mod.serveMain(alloc, sesh);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
 
@@ -879,6 +929,8 @@ fn help() !void {
         \\
         \\Commands:
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
+        \\                                 (use --remote <user@host> for encrypted UDP attach)
+        \\  [s]erve <name>                 Start UDP gateway for remote access to a session
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
         \\  [l]ist [--short]               List active sessions
