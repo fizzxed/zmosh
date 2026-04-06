@@ -10,4 +10,5 @@ comptime {
     _ = @import("cc.zig");
     _ = @import("remote.zig");
     _ = @import("reorder_buffer.zig");
+    _ = @import("net_sim.zig");
 }
