@@ -6,4 +6,5 @@ comptime {
     _ = @import("udp.zig");
     _ = @import("transport.zig");
     _ = @import("c4.zig");
+    _ = @import("pacer.zig");
 }
