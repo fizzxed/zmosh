@@ -9,4 +9,5 @@ comptime {
     _ = @import("pacer.zig");
     _ = @import("cc.zig");
     _ = @import("remote.zig");
+    _ = @import("reorder_buffer.zig");
 }
