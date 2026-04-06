@@ -7,4 +7,5 @@ comptime {
     _ = @import("transport.zig");
     _ = @import("c4.zig");
     _ = @import("pacer.zig");
+    _ = @import("cc.zig");
 }
