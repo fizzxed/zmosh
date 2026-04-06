@@ -119,16 +119,19 @@ pub const OutputRecvState = struct {
             return .accept;
         }
 
-        if (seq == self.latest + 1) {
+        // Compare seqs modulo 2^32 using signed difference (RFC 793 style).
+        // Wrapping subtract, then reinterpret as i32: positive values mean
+        // `seq` is "ahead" of `latest` in the wrapping sense, negative means
+        // "behind". This lets output_seq wrap through 0 without breaking
+        // gap/duplicate detection.
+        const diff: i32 = @bitCast(seq -% self.latest);
+        if (diff == 0) return .duplicate;
+        if (diff < 0) return .duplicate; // old packet, possibly reordered
+        if (diff == 1) {
             self.latest = seq;
             return .accept;
         }
-
-        if (seq <= self.latest) {
-            return .duplicate;
-        }
-
-        // seq jumped ahead.
+        // seq jumped ahead by more than one
         self.latest = seq;
         return .gap;
     }
@@ -378,4 +381,31 @@ test "output gap detection" {
     try std.testing.expect(out.onPacket(1) == .accept);
     try std.testing.expect(out.onPacket(3) == .gap);
     try std.testing.expect(out.onPacket(2) == .duplicate);
+}
+
+test "output recv wraps through u32 boundary" {
+    var out = OutputRecvState{};
+    // Push latest near the top of the seq space.
+    out.latest = 0xFFFF_FFFE;
+    out.has_latest = true;
+
+    // latest+1 = 0xFFFF_FFFF → accept
+    try std.testing.expect(out.onPacket(0xFFFF_FFFF) == .accept);
+    try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), out.latest);
+
+    // latest+1 = 0 (wrap) → accept
+    try std.testing.expect(out.onPacket(0) == .accept);
+    try std.testing.expectEqual(@as(u32, 0), out.latest);
+
+    // latest+1 = 1 → accept
+    try std.testing.expect(out.onPacket(1) == .accept);
+
+    // Jump ahead past wrap → gap
+    try std.testing.expect(out.onPacket(5) == .gap);
+    try std.testing.expectEqual(@as(u32, 5), out.latest);
+
+    // An old packet from before the wrap must still be .duplicate,
+    // not accepted as "ahead" just because its raw u32 value is larger.
+    try std.testing.expect(out.onPacket(0xFFFF_FF00) == .duplicate);
+    try std.testing.expectEqual(@as(u32, 5), out.latest);
 }
