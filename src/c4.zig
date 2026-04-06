@@ -9,7 +9,7 @@
 //! - recovery: Freeze for one RTT after a congestion event, giving time to
 //!             measure whether the previous push actually moved things.
 //! - cruising: Hold nominal rate for N cruise periods (Fibonacci backoff on
-//!             the probe level), then push. Listen for delay/ECN/loss signals.
+//!             the probe level), then push. Listen for delay/loss signals.
 //! - pushing:  One RTT of probing 3.125%..25% above nominal to look for
 //!             available headroom, then transition to recovery.
 //!
@@ -64,9 +64,6 @@ pub const max_rtt_min_us: u64 = 1000;
 /// Cap on sample-to-running jitter to avoid aberrant max-RTT inflation.
 pub const max_jitter_us: u64 = 250_000;
 
-/// ECN alpha EWMA gain: `g = 1/2^4`.
-pub const ecn_shift_g: u6 = 4;
-
 pub const probe_level_max: u8 = 3;
 pub const probe_level_default: u8 = 1;
 
@@ -96,7 +93,6 @@ pub const AlgState = enum(u8) {
 pub const CongestionMode = enum(u8) {
     none = 0,
     delay,
-    ecn,
     loss,
 };
 
@@ -222,13 +218,6 @@ pub const State = struct {
     last_lost_packet_number: u64 = 0,
     smoothed_drop_rate: f64 = 0,
 
-    /// ECN alpha EWMA and the threshold at which ECN marks are treated as a
-    /// congestion event.
-    ecn_alpha_1024: u64 = 0,
-    ecn_ect1: u64 = 0,
-    ecn_ce: u64 = 0,
-    ecn_threshold_1024: u64 = 0,
-
     /// Sticky signal that a congestion event has been observed during the
     /// current era. Cleared by `growthReset`.
     congestion_notified: bool = false,
@@ -240,8 +229,6 @@ pub const State = struct {
     /// We have already re-entered Initial once due to jitter; don't do it
     /// again.
     initial_after_jitter: bool = false,
-    /// Excess ECN CE marks were observed after the most recent push.
-    excess_ce_after_push: bool = false,
 
     pub fn init() State {
         return .{};
@@ -293,12 +280,6 @@ pub fn delayThreshold(state: *const State) u64 {
     return delay;
 }
 
-/// ECN marking threshold (1024-scale).
-pub fn ecnThreshold(state: *const State) u64 {
-    const sens = sensitivity1024(state);
-    return 192 - mult1024(sens, 96);
-}
-
 /// Loss-rate threshold as a fraction in [0,1]. Picoquic uses a double here.
 pub fn lossThreshold(state: *const State) f64 {
     const sens = sensitivity1024(state);
@@ -318,8 +299,6 @@ fn eraReset(state: *State, ctx: *CcContext) void {
     state.era_max_rtt_us = 0;
     state.era_min_rtt_us = std.math.maxInt(u64);
     state.alpha_1024_previous = state.alpha_1024_current;
-    // ECN alpha update is a stub in zmosh — see updateEcnAlpha.
-    updateEcnAlpha(state, ctx);
 }
 
 fn growthReset(state: *State) void {
@@ -336,15 +315,6 @@ fn growthEvaluate(state: *const State) bool {
         return state.nominal_rate > target_rate;
     }
     return state.nominal_rate > state.push_rate_old and !state.congestion_notified;
-}
-
-// -- ECN (stub) -------------------------------------------------------------
-
-/// TODO: zmosh transport does not yet surface ECN counters. When it does,
-/// port picoquic's `c4_update_ecn_alpha` logic here. For now this is a noop.
-fn updateEcnAlpha(state: *State, ctx: *CcContext) void {
-    _ = state;
-    _ = ctx;
 }
 
 // -- apply rate & cwnd ------------------------------------------------------
@@ -410,7 +380,6 @@ fn enterInitial(state: *State, ctx: *CcContext) void {
     state.nb_packets_in_startup = 0;
     eraReset(state, ctx);
     state.nb_eras_no_increase = 0;
-    state.ecn_alpha_1024 = 0;
     growthReset(state);
 }
 
@@ -423,15 +392,14 @@ fn exitInitial(state: *State, ctx: *CcContext) void {
     state.delay_threshold_us = delayThreshold(state);
     state.nb_eras_no_increase = 0;
     state.probe_level = probe_level_default;
-    enterRecovery(state, ctx, .none);
+    enterRecovery(state, ctx);
 }
 
-fn enterRecovery(state: *State, ctx: *CcContext, c_mode: CongestionMode) void {
+fn enterRecovery(state: *State, ctx: *CcContext) void {
     if (state.alg_state == .initial) {
         growthReset(state);
     }
     if (state.alg_state != .recovery) {
-        state.excess_ce_after_push = (c_mode == .ecn);
         state.alg_state = .recovery;
         eraReset(state, ctx);
         state.alpha_1024_current = alpha_recover_1024;
@@ -441,17 +409,13 @@ fn enterRecovery(state: *State, ctx: *CcContext, c_mode: CongestionMode) void {
 fn exitRecovery(state: *State, ctx: *CcContext) void {
     const is_growing = growthEvaluate(state);
     if (is_growing) {
-        if (!state.excess_ce_after_push and state.probe_level < 255) {
-            state.probe_level += 1;
-        }
+        if (state.probe_level < 255) state.probe_level += 1;
     } else if (state.push_was_not_limited) {
         state.probe_level = 1;
-        if (state.excess_ce_after_push) state.probe_level = 0;
     }
     growthReset(state);
     state.recent_delay_excess_us = 0;
     state.smoothed_drop_rate = 0;
-    state.ecn_alpha_1024 = 0;
 
     if (state.probe_level > probe_level_max) {
         enterInitial(state, ctx);
@@ -555,12 +519,6 @@ fn notifyCongestion(state: *State, ctx: *CcContext, rtt_latest: u64, c_mode: Con
         .loss => {
             beta = (beta_loss_1024 + mult1024(sensitivity1024(state), beta_loss_1024)) / 2;
         },
-        .ecn => {
-            if (state.ecn_threshold_1024 > 0 and state.ecn_alpha_1024 > state.ecn_threshold_1024) {
-                beta = (state.ecn_alpha_1024 - state.ecn_threshold_1024) * 1024 / state.ecn_threshold_1024;
-                if (beta > beta_loss_1024) beta = beta_loss_1024;
-            } else beta = beta_loss_1024;
-        },
         .delay => {
             if (state.delay_threshold_us > 0) {
                 beta = state.recent_delay_excess_us * 1024 / state.delay_threshold_us;
@@ -580,7 +538,6 @@ fn notifyCongestion(state: *State, ctx: *CcContext, rtt_latest: u64, c_mode: Con
             state.alpha_1024_current = alpha_recover2_1024;
             state.era_sequence = ctx.next_sequence_number_fn(ctx.transport_ctx);
         }
-        if (c_mode == .ecn) state.excess_ce_after_push = true;
     } else {
         if (state.alg_state != .pushing) {
             state.nominal_rate -= mult1024(beta, state.nominal_rate);
@@ -592,7 +549,7 @@ fn notifyCongestion(state: *State, ctx: *CcContext, rtt_latest: u64, c_mode: Con
                 state.delay_threshold_us = delayThreshold(state);
             }
         }
-        enterRecovery(state, ctx, c_mode);
+        enterRecovery(state, ctx);
     }
 
     applyRateAndCwin(state, ctx);
@@ -755,7 +712,7 @@ fn handleAck(state: *State, ctx: *CcContext, ack: AckState, now_us: u64) void {
                 enterPush(state, ctx);
             }
         },
-        .pushing => enterRecovery(state, ctx, .none),
+        .pushing => enterRecovery(state, ctx),
         .initial => eraReset(state, ctx),
     }
 }
