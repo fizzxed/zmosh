@@ -36,6 +36,10 @@ pub fn get_session_entries(
     var iter = dir.iterate();
 
     var sessions = try std.ArrayList(SessionEntry).initCapacity(alloc, 30);
+    errdefer {
+        for (sessions.items) |session| session.deinit(alloc);
+        sessions.deinit(alloc);
+    }
 
     while (try iter.next()) |entry| {
         const exists = socket.sessionExists(dir, entry.name) catch continue;
@@ -78,10 +82,12 @@ pub fn get_session_entries(
                 alloc.dupe(u8, result.info.cmd[0..cmd_len]) catch null
             else
                 null;
+            errdefer if (cmd) |c| alloc.free(c);
             const cwd: ?[]const u8 = if (cwd_len > 0)
                 alloc.dupe(u8, result.info.cwd[0..cwd_len]) catch null
             else
                 null;
+            errdefer if (cwd) |c| alloc.free(c);
 
             try sessions.append(alloc, .{
                 .name = name,

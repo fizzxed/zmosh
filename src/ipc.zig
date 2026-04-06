@@ -196,27 +196,35 @@ pub fn probeSession(
 
     send(fd, .Info, "") catch return error.Unexpected;
 
-    var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
-    const poll_result = posix.poll(&poll_fds, timeout_ms) catch return error.Unexpected;
-    if (poll_result == 0) {
-        return error.Timeout;
-    }
-
     var sb = SocketBuffer.init(alloc) catch return error.Unexpected;
     defer sb.deinit();
 
-    const n = sb.read(fd) catch return error.Unexpected;
-    if (n == 0) return error.Unexpected;
+    // The daemon broadcasts PTY output to every connected fd, so our
+    // probe socket may receive Output messages before the Info reply.
+    // The reply can also be split across reads on a SOCK_STREAM socket.
+    // Loop poll+read until we find the Info message or time out.
+    var remaining_ms: i32 = timeout_ms;
+    while (remaining_ms > 0) {
+        var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN, .revents = 0 }};
+        const before = std.time.milliTimestamp();
+        const poll_result = posix.poll(&poll_fds, remaining_ms) catch return error.Unexpected;
+        const elapsed: i32 = @intCast(@min(std.time.milliTimestamp() - before, timeout_ms));
+        remaining_ms -= elapsed;
+        if (poll_result == 0) return error.Timeout;
 
-    while (sb.next()) |msg| {
-        if (msg.header.tag == .Info) {
-            if (msg.payload.len == @sizeOf(Info)) {
-                return .{
-                    .fd = fd,
-                    .info = std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]),
-                };
+        const n = sb.read(fd) catch return error.Unexpected;
+        if (n == 0) return error.Unexpected;
+
+        while (sb.next()) |msg| {
+            if (msg.header.tag == .Info) {
+                if (msg.payload.len == @sizeOf(Info)) {
+                    return .{
+                        .fd = fd,
+                        .info = std.mem.bytesToValue(Info, msg.payload[0..@sizeOf(Info)]),
+                    };
+                }
             }
         }
     }
-    return error.Unexpected;
+    return error.Timeout;
 }
