@@ -4,6 +4,7 @@ const crypto = @import("crypto.zig");
 const udp = @import("udp.zig");
 const ipc = @import("ipc.zig");
 const transport = @import("transport.zig");
+const cc_mod = @import("cc.zig");
 
 const log = std.log.scoped(.serve);
 
@@ -75,6 +76,13 @@ pub const Gateway = struct {
     have_client_size: bool,
     last_resize: ipc.Resize,
 
+    /// Congestion controller for the server->client output path.
+    cc: cc_mod.CongestionController,
+    /// Absolute us time at which we should retry a pacer-blocked send.
+    cc_next_wait_us: u64,
+    /// Oldest unacked output seq, for the naive ack-oldest-on-heartbeat model.
+    cc_oldest_unacked: u32,
+
     pub fn init(
         alloc: std.mem.Allocator,
         session_name: []const u8,
@@ -133,6 +141,9 @@ pub const Gateway = struct {
 
         log.info("gateway started session={s} udp_port={d}", .{ session_name, udp_sock.bound_port });
 
+        var cc: cc_mod.CongestionController = undefined;
+        cc.init(@intCast(transport.max_payload_len + 20), nowUs());
+
         return .{
             .alloc = alloc,
             .udp_sock = udp_sock,
@@ -152,7 +163,14 @@ pub const Gateway = struct {
             .last_resync_request_ns = 0,
             .have_client_size = false,
             .last_resize = .{ .rows = 24, .cols = 80 },
+            .cc = cc,
+            .cc_next_wait_us = 0,
+            .cc_oldest_unacked = 0,
         };
+    }
+
+    fn nowUs() u64 {
+        return @intCast(@divFloor(std.time.nanoTimestamp(), std.time.ns_per_us));
     }
 
     pub fn run(self: *Gateway) !void {
@@ -282,6 +300,15 @@ pub const Gateway = struct {
 
         if (self.ack_dirty) timeout = @min(timeout, @as(i64, 20));
 
+        // If the pacer wants us to wait, honour that (bounded to >=0).
+        if (self.cc_next_wait_us != 0 and self.output_coalesce_buf.items.len > 0) {
+            const now_us = nowUs();
+            if (self.cc_next_wait_us > now_us) {
+                const wait_ms = @divFloor(self.cc_next_wait_us - now_us, 1000) + 1;
+                timeout = @min(timeout, @as(i64, @intCast(wait_ms)));
+            }
+        }
+
         return @intCast(@max(@as(i64, 0), timeout));
     }
 
@@ -332,6 +359,13 @@ pub const Gateway = struct {
         while (sent_off < self.output_coalesce_buf.items.len) {
             const end = @min(sent_off + transport.max_payload_len, self.output_coalesce_buf.items.len);
             const chunk = self.output_coalesce_buf.items[sent_off..end];
+            const pkt_size: u64 = chunk.len + 20;
+
+            const now_us = nowUs();
+            if (!self.cc.canSend(pkt_size, now_us)) {
+                self.cc_next_wait_us = self.cc.nextSendTimeUs(pkt_size, now_us);
+                break;
+            }
 
             var pkt_buf: [1200]u8 = undefined;
             const seq = self.output_seq;
@@ -361,14 +395,16 @@ pub const Gateway = struct {
                 return err;
             };
 
+            self.cc.onPacketSent(seq, @intCast(pkt_size), now_us);
+            if (self.cc_oldest_unacked == 0) self.cc_oldest_unacked = seq;
+
             sent_off = end;
         }
 
         if (sent_off > 0) {
             self.output_coalesce_buf.replaceRange(self.alloc, 0, sent_off, &[_]u8{}) catch unreachable;
+            self.last_output_flush_ns = now;
         }
-
-        self.last_output_flush_ns = now;
     }
 
     fn trackClientResize(self: *Gateway, payload: []const u8) void {
@@ -414,6 +450,21 @@ pub const Gateway = struct {
         };
 
         self.reliable_send.ack(packet.ack, packet.ack_bits);
+
+        // TODO: the output channel is currently unreliable and has no ACKs.
+        // As a minimal CC feeding strategy, treat each received packet as
+        // implicit progress: ack the oldest outstanding output seq (if any)
+        // using the peer's current smoothed RTT. This gives C4 an RTT stream
+        // and lets bytes_in_transit drain, though it does not detect loss.
+        // Proper integration would extend the client heartbeat to carry an
+        // output-channel ack_seq/ack_bits just like the reliable channel.
+        const now_us = nowUs();
+        const rtt_us: u64 = if (self.peer.srtt_us) |s| @intCast(@max(@as(i64, 1000), s)) else 0;
+        if (self.cc_oldest_unacked != 0) {
+            const acked = self.cc_oldest_unacked;
+            self.cc_oldest_unacked = if (acked + 1 < self.output_seq) acked + 1 else 0;
+            self.cc.onAck(acked, rtt_us, now_us);
+        }
 
         switch (packet.channel) {
             .heartbeat => {},
